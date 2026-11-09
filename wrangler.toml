@@ -9,3 +9,12 @@ id = "bbca085bcb564bf3a57375b373f7c524"
 [[kv_namespaces]]
 binding = "LEVEL_KV"
 id = "2d8f6cb816814df89742dd407b8ca074"
+
+# v7 M-16：每用户等级记录的单写者 Durable Object（LevelStore）。
+# 免费套餐必须用 new_sqlite_classes，否则报 10097（照抄邀请码 Worker 的 InviteClaim）。
+[[durable_objects]]
+bindings = [{ name = "LEVEL_STORE", class_name = "LevelStore" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LevelStore"]

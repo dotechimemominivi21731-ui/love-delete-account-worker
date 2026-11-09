@@ -1,9 +1,10 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v6
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v7
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
 //   POST /admin-delete    管理员帮别人删号: 管理员不需要被删账号的密码, 凭管理员密钥删号。
-//   POST /level/*         情侣等级/经验/签到/邮件改由服务器说了算 (v10.0):
+//   POST /level/*         情侣等级/经验/签到/邮件改由服务器说了算 (v10.0)，
+//                         等级记录存在 Durable Object 里（每用户单写者，v7）：
 //     /level/checkin          每日签到 +4 XP (服务器日期说了算, 改手机时间刷不了)
 //     /level/add-xp           发消息 +2 XP (每天最多 4 条, 1:1 和大厅共用计数, 须双向绑定)
 //     /level/claim-mail       领邮件 (服务器判重, 同一封只能领一次)
@@ -40,6 +41,24 @@
 // app 因网络问题重试时，先查缓存——缓存命中且环信那边已查无此人，
 // 就直接返回上次的成功结果，不再重复删；同名新账号仍在则走正常流程。
 // 失败的结果不缓存，重试会重新走流程。app 不用改，重试逻辑本来就有。
+//
+// v7 (2026-11-10) M-16 彻底修：等级记录改走 Durable Object 单写者。
+//   用户改主意了，DO 也要修（v6 曾按“已知窄窗口”记下，见下）。
+//   新增 LevelStore（export class，binding LEVEL_STORE，migration tag v1，
+//     new_sqlite_classes——免费套餐必须用这个，否则报 10097；照抄
+//     邀请码 Worker 的 InviteClaim 那套）。
+//   每用户一个 DO 实例（idFromName("level:"+username)），记录存在 DO
+//     存储里；checkin/add-xp/claim-mail/bind/unbind/自愈清 bound/migrate
+//     全部走 DO 里的单次 apply，同一用户的并发改动在 DO 内串行，
+//     KV 读-改-写竞态彻底消失。读（get-couple/get-other）也走 DO。
+//   老数据不丢：DO 里没有记录时，第一次访问从 LEVEL_KV 的 u: 懒迁移
+//     进来；每次写回再同步一份到 LEVEL_KV 当镜像（DO 存储才是账本）。
+//     mail:/ann:/idem-mail: 键仍在 KV（单次写入、无读改写竞态，不动）。
+//   wrangler.toml：保留 IDEM_KV/LEVEL_KV，加 DO 绑定 + migration；
+//     5 个密钥仍在 Dashboard Secrets 里，不进仓库、不动。
+//   兼容：接口、请求体、返回字段与 v6 一字不差，app v10.2 不用改。
+//   判别式：DO 绑定没生效时 /level/* 一律 500（LEVEL_STORE 未绑定），
+//     生效时错密码照旧 403。
 //
 // v6 (2026-11-10) 审计 v10.0-v2.1 的第二批修复：
 //   M-17：cmail 上限从 100 提到 1000（LEVEL_MAX_CLAIMED_MAIL_IDS），
@@ -236,11 +255,14 @@ async function idemReplay(env, kind, username) {
 }
 
 // ================= v4: 情侣等级/经验/签到/邮件（服务器说了算） =================
-// KV 模型（love-level，变量名 LEVEL_KV）：
-//   u:<username> → { bound, xp, ck, msgd, msgc, stitles[], cmail[]（最近 1000 个）, dtitle, updatedAt }
-//   ann:<sha256(标题+"\n"+内容)> → { at }（公告去重，60 秒过期）
+// KV 模型（love-level，变量名 LEVEL_KV）——v7 起等级记录 u: 不再是账本：
+//   u:<username> → DO（LevelStore）的写回镜像 + 首次访问的懒迁移来源；
+//     账本在 DO 存储里（SQLite），每用户一个 DO 实例单写者。
 //   mail:<mail_id> → { kind, amount|title, scope, to, from, createdAt }（v5：发邮件登记，领邮件时验真；不设过期，管理员发的邮件量很小）
 //   idem-mail:<idempotency_key> → { mail_id }（v5：发邮件幂等，10 分钟过期）
+//   ann:<sha256(标题+"\n"+内容)> → { at }（公告去重，60 秒过期）
+// 等级记录的字段（DO 里的形状，和原来 KV 里的一样）：
+//   { bound, xp, ck, msgd, msgc, stitles[], cmail[]（最近 1000 个）, dtitle, updatedAt }
 // 等级曲线和称号表和 app 里 CoupleLevel 一模一样：
 //   LV.n 升 LV.n+1 要 100+(n-1)*20 XP；升到 LV.L 总共要 10*(L-1)*(L+8) XP；最高 18 级。
 const LEVEL_TITLES = [
@@ -316,43 +338,42 @@ function parseLevelRecord(raw) {
   return rec;
 }
 
-// 读一条等级记录；没有就给一份空的（不写回，等真正改了再写）。
-async function levelLoad(env, username) {
-  if (!env.LEVEL_KV) return parseLevelRecord(null);
-  try {
-    const raw = await env.LEVEL_KV.get("u:" + username);
-    return parseLevelRecord(raw);
-  } catch { return parseLevelRecord(null); }
+// v7 M-16：等级记录的读写全部走每用户 DO（LevelStore），不再直接读改 KV。
+// DO 未绑定时直接抛错（handleLevelRequest 开头已先拦一道，正常情况下
+// 到不了这里）；DO 调用返回的业务错误（{ok:false}，HTTP 200）原样返回，
+// 只有 HTTP 非 2xx 或读不懂的回包才抛错。
+function levelStoreStub(env, username) {
+  if (!env.LEVEL_STORE) throw new Error("LEVEL_STORE 未绑定");
+  const id = env.LEVEL_STORE.idFromName("level:" + username);
+  return env.LEVEL_STORE.get(id);
 }
 
-async function levelSave(env, username, rec) {
-  if (!env.LEVEL_KV) return;
-  await env.LEVEL_KV.put("u:" + username, JSON.stringify(rec));
-}
-
-// v5 M-16：KV 没有 CAS/事务，读-改-写并发会丢更新。
-// 缓解：改记录的接口都走 levelMutate——读、改、写前再读一次比对，
-// 期间有人写过就在新记录上重做一次改动再写。窗口从"整个请求"
-// （含环信密码校验的网络往返）缩到"一次 KV 读 + 一次写"的毫秒级。
-// v6 评估结论：彻底修要上 Durable Object（当锁或当账本），改动面大、
-// 还要搬 live 数据，风险不可控，而实际伤害只是偶丢一次 +2/+4 XP；
-// 选 (a) 保留本缓解，M-16 记为“已知窄窗口、未彻底修”，详见文件头 v6。
-// fn(rec) 是纯改动：改 rec 的字段；返回 null 表示成功，返回错误字符串
-// 表示本次改动不成立（如已签到/已领过），此时不写回。
-// 返回 { ok: true, rec }（写回后的记录）或 { ok: false, error }。
-async function levelMutate(env, username, fn) {
-  const raw1 = await env.LEVEL_KV.get("u:" + username);
-  let rec = parseLevelRecord(raw1);
-  let err = fn(rec);
-  if (err) return { ok: false, error: err };
-  const raw2 = await env.LEVEL_KV.get("u:" + username);
-  if (raw2 !== raw1) {
-    rec = parseLevelRecord(raw2);
-    err = fn(rec);
-    if (err) return { ok: false, error: err };
+async function levelDoCall(env, username, path, body) {
+  const stub = levelStoreStub(env, username);
+  const res = await stub.fetch("https://do" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error("等级存储调用失败: HTTP " + res.status + " " + t.slice(0, 200));
   }
-  await levelSave(env, username, rec);
-  return { ok: true, rec };
+  return await res.json();
+}
+
+// 读一条等级记录（走 DO；DO 里没有时会从 LEVEL_KV 懒迁移）。
+async function levelLoad(env, username) {
+  const j = await levelDoCall(env, username, "/load", { username });
+  return parseLevelRecord(JSON.stringify(j.record || null));
+}
+
+// 在 DO 里对一条记录做一次改动；返回 DO 的回包 { ok, rec, ... }
+// （rec 已归一化；业务不成立时 ok:false + error，不抛错）。
+async function levelApply(env, username, op, payload) {
+  const j = await levelDoCall(env, username, "/apply", { username, op, ...(payload || {}) });
+  if (j.rec) j.rec = parseLevelRecord(JSON.stringify(j.rec));
+  return j;
 }
 
 // 情侣总分 = 我 + 对方（对方记录也指回我才算，否则只算我自己的）。
@@ -474,10 +495,174 @@ function levelMergeMigrateRecords(server, snap) {
   return merged;
 }
 
+// v7 M-16：每用户等级记录的单写者（Durable Object，强一致）。
+// 每个用户一个 DO 实例（idFromName("level:" + username)），记录存在
+// DO 存储里（SQLite，new_sqlite_classes）。DO 在 Cloudflare 侧是单线程
+// 串行处理请求的，所以同一用户的并发改动不会互相覆盖——KV 读-改-写
+// 竞态彻底消失，不再需要 v5 的 levelMutate 乐观重试（已删）。
+// LEVEL_KV 里的 u: 记录只作两件事：① 首次访问时懒迁移进 DO（老数据
+// 不丢）；② 每次写回时同步一份镜像（方便排障/回滚，DO 存储才是账本）。
+// mail:/ann:/idem-mail: 键仍在 KV 里（单次写入、无读改写竞态，不动）。
+export class LevelStore {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    let body = {};
+    try { body = await request.json(); } catch { /* ignore */ }
+    if (request.method === "POST" && url.pathname === "/load") {
+      const username = typeof body.username === "string" ? body.username : "";
+      const r = await this.loadRecord(username);
+      return json({ ok: true, record: r.rec, existed: r.existed });
+    }
+    if (request.method === "POST" && url.pathname === "/apply") {
+      return await this.applyOp(body);
+    }
+    return json({ ok: false, error: "not found" }, 404);
+  }
+
+  // 读记录；DO 里没有时从 LEVEL_KV 懒迁移（老数据不丢）。
+  // 返回 { rec, existed }：existed 表示迁移前就已有记录
+  // （DO 里有，或 KV 里有）。
+  async loadRecord(username) {
+    try {
+      const raw = await this.state.storage.get("rec");
+      if (raw) return { rec: parseLevelRecord(raw), existed: true };
+    } catch { /* 存储读失败时往下走 KV */ }
+    if (username && this.env.LEVEL_KV) {
+      try {
+        const kvRaw = await this.env.LEVEL_KV.get("u:" + username);
+        if (kvRaw) {
+          const rec = parseLevelRecord(kvRaw);
+          try { await this.state.storage.put("rec", JSON.stringify(rec)); } catch { /* ignore */ }
+          return { rec, existed: true };
+        }
+      } catch { /* KV 读失败就按空记录走 */ }
+    }
+    return { rec: parseLevelRecord(null), existed: false };
+  }
+
+  // 写回：DO 存储是账本；再同步一份到 LEVEL_KV 当镜像
+  // （镜像写失败不影响本次改动——账本已落盘）。
+  async saveRecord(username, rec) {
+    await this.state.storage.put("rec", JSON.stringify(rec));
+    if (username && this.env.LEVEL_KV) {
+      try { await this.env.LEVEL_KV.put("u:" + username, JSON.stringify(rec)); } catch { /* ignore */ }
+    }
+  }
+
+  // 在 DO 内对一条记录做一次改动（串行，原子）。
+  // body: { username, op, ...op 参数 }；成功回 {ok:true, rec, ...}，
+  // 业务不成立回 {ok:false, error}（HTTP 200，调用方原样转给 app）。
+  async applyOp(body) {
+    const username = typeof body.username === "string" ? body.username : "";
+    const op = body.op;
+    if (!username || !op) return json({ ok: false, error: "缺少 username 或 op" }, 400);
+    const loaded = await this.loadRecord(username);
+    const rec = loaded.rec;
+    let result = null;
+    switch (op) {
+      case "checkin": {
+        const d = body.today;
+        if (typeof d !== "string" || !isValidDateStr(d)) return json({ ok: false, error: "日期不对" }, 400);
+        if (rec.ck === d) return json({ ok: false, error: "今天已经签到过了" });
+        rec.xp += LEVEL_CHECKIN_XP;
+        rec.ck = d;
+        break;
+      }
+      case "add-xp": {
+        const d = body.today;
+        if (typeof d !== "string" || !isValidDateStr(d)) return json({ ok: false, error: "日期不对" }, 400);
+        if (!rec.bound) return json({ ok: false, error: "还没有绑定情侣" });
+        if (rec.msgd !== d) { rec.msgd = d; rec.msgc = 0; }
+        result = { counted: false };
+        if (rec.msgc < LEVEL_MESSAGE_DAILY_MAX) {
+          rec.msgc += 1;
+          rec.xp += LEVEL_MESSAGE_XP;
+          result.counted = true;
+        }
+        break;
+      }
+      case "claim-mail": {
+        const mailId = body.mail_id;
+        const kind = body.kind;
+        if (typeof mailId !== "string" || !mailId) return json({ ok: false, error: "缺少 mail_id" }, 400);
+        if (rec.cmail.indexOf(mailId) !== -1) return json({ ok: false, error: "已经领过了" });
+        if (kind === "xp") {
+          rec.xp += Math.floor(body.amount);
+        } else {
+          const title = body.title;
+          if (rec.stitles.indexOf(title) === -1) rec.stitles.push(title);
+        }
+        rec.cmail.push(mailId);
+        if (rec.cmail.length > LEVEL_MAX_CLAIMED_MAIL_IDS) {
+          rec.cmail = rec.cmail.slice(rec.cmail.length - LEVEL_MAX_CLAIMED_MAIL_IDS);
+        }
+        break;
+      }
+      case "bind": {
+        if (typeof body.partner !== "string" || !body.partner) return json({ ok: false, error: "对方用户名不对" }, 400);
+        rec.bound = body.partner;
+        break;
+      }
+      case "unbind": {
+        const partnerName = rec.bound;
+        rec.bound = "";
+        rec.xp = 0;
+        rec.ck = "";
+        rec.msgd = "";
+        rec.msgc = 0;
+        if (rec.stitles.indexOf(rec.dtitle) === -1) rec.dtitle = "";
+        result = { partner: partnerName };
+        break;
+      }
+      case "heal-unbind": {
+        rec.bound = "";
+        break;
+      }
+      case "clear-bound-if": {
+        // 对方解绑时清掉我这边指回对方的 bound
+        if (rec.bound === body.by) rec.bound = "";
+        break;
+      }
+      case "migrate": {
+        const ext = body.ext && typeof body.ext === "object" ? body.ext : {};
+        const snap = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "", updatedAt: 0 };
+        if (typeof ext.bound === "string") snap.bound = ext.bound;
+        if (typeof ext.xp === "number" && ext.xp >= 0) snap.xp = Math.floor(ext.xp);
+        if (isValidDateStr(ext.ck)) snap.ck = ext.ck;
+        if (isValidDateStr(ext.msgd)) snap.msgd = ext.msgd;
+        if (typeof ext.msgc === "number" && ext.msgc >= 0) snap.msgc = Math.floor(ext.msgc);
+        if (Array.isArray(ext.stitles)) snap.stitles = ext.stitles.filter((t) => typeof t === "string");
+        if (Array.isArray(ext.cmail)) snap.cmail = ext.cmail.slice(-LEVEL_MAX_CLAIMED_MAIL_IDS).filter((t) => typeof t === "string");
+        if (typeof ext.dtitle === "string") snap.dtitle = ext.dtitle;
+        if (typeof body.updatedAt === "number" && body.updatedAt >= 0) snap.updatedAt = Math.floor(body.updatedAt);
+        const wasExisted = loaded.existed;
+        Object.assign(rec, levelMergeMigrateRecords(rec, snap));
+        result = { migrated: !wasExisted, merged: wasExisted };
+        break;
+      }
+      default:
+        return json({ ok: false, error: "不支持的操作" }, 400);
+    }
+    await this.saveRecord(username, rec);
+    return json({ ok: true, rec, ...(result || {}) });
+  }
+}
+
 // ---------- /level/* 各接口（body 已解析好） ----------
 async function handleLevelRequest(env, path, body) {
   if (!env.LEVEL_KV) {
     return json({ ok: false, error: "Worker 还没配好等级数据（LEVEL_KV 未绑定）" }, 500);
+  }
+  // v7 M-16：等级记录在 DO 里；DO 绑定没生效时直接 500，
+  // 别让请求走到一半才在 DO 调用处炸掉。判别式：绑定生效时错密码
+  // 照旧 403，没生效时 /level/* 一律报这个 500。
+  if (!env.LEVEL_STORE) {
+    return json({ ok: false, error: "Worker 还没配好等级存储（LEVEL_STORE 未绑定）" }, 500);
   }
 
   // ----- POST /level/checkin：每日签到 +4 XP -----
@@ -489,12 +674,7 @@ async function handleLevelRequest(env, path, body) {
     if (typeof body.today === "string" && body.today !== d) {
       return json({ ok: false, error: "日期对不上，请检查手机时间" }, 400);
     }
-    const r = await levelMutate(env, username, (rec) => {
-      if (rec.ck === d) return "今天已经签到过了";
-      rec.xp += LEVEL_CHECKIN_XP;
-      rec.ck = d;
-      return null;
-    });
+    const r = await levelApply(env, username, "checkin", { today: d });
     if (!r.ok) return json({ ok: false, error: r.error });
     const rec = r.rec;
     const total = await levelCoupleTotal(env, rec, username);
@@ -515,23 +695,14 @@ async function handleLevelRequest(env, path, body) {
     if (!rec.bound) return json({ ok: false, error: "还没有绑定情侣" });
     const partner = await levelLoad(env, rec.bound);
     if (partner.bound !== username) return json({ ok: false, error: "还没有绑定情侣" });
-    // counted 在闭包里：fn 可能因重试跑两次，每次开头先清零，
-    // 最终值以实际写回的那次为准。
-    let counted = false;
-    const r = await levelMutate(env, username, (m) => {
-      counted = false;
-      if (m.msgd !== d) { m.msgd = d; m.msgc = 0; }
-      if (m.msgc < LEVEL_MESSAGE_DAILY_MAX) {
-        m.msgc += 1;
-        m.xp += LEVEL_MESSAGE_XP;
-        counted = true;
-      }
-      return null;
-    });
+    // v7：双向校验在 DO 外做（和 v6 一样），加分本身在 DO 内做；
+    // 对方恰好在校验后解绑的窗口仍在（和 v6 相同），最多多加一次 +2，
+    // 下次 get-couple 自愈会纠正绑定状态。
+    const r = await levelApply(env, username, "add-xp", { today: d });
     if (!r.ok) return json({ ok: false, error: r.error });
     const total = r.rec.xp + partner.xp;
     const level = levelForXp(total);
-    return json({ ok: true, xp: r.rec.xp, totalXp: total, level: level, title: levelTitleFor(level), counted: counted });
+    return json({ ok: true, xp: r.rec.xp, totalXp: total, level: level, title: levelTitleFor(level), counted: r.counted });
   }
 
   // ----- POST /level/claim-mail：领邮件（服务器判重，同一封只能领一次） -----
@@ -561,18 +732,12 @@ async function handleLevelRequest(env, path, body) {
     if (kind === "xp" && mail.amount !== Math.floor(amount)) return json({ ok: false, error: "邮件内容对不上" });
     if (kind === "title" && mail.title !== title) return json({ ok: false, error: "邮件内容对不上" });
     if (mail.scope === "one" && mail.to && mail.to !== username) return json({ ok: false, error: "这封邮件不是发给你的" });
-    const r = await levelMutate(env, username, (rec) => {
-      if (rec.cmail.indexOf(mailId) !== -1) return "已经领过了";
-      if (kind === "xp") {
-        rec.xp += Math.floor(amount);
-      } else {
-        if (rec.stitles.indexOf(title) === -1) rec.stitles.push(title);
-      }
-      rec.cmail.push(mailId);
-      if (rec.cmail.length > LEVEL_MAX_CLAIMED_MAIL_IDS) {
-        rec.cmail = rec.cmail.slice(rec.cmail.length - LEVEL_MAX_CLAIMED_MAIL_IDS);
-      }
-      return null;
+    // v7：判重 + 加经验/称号在 DO 内一次做完，同一封并发领两次也只会
+    // 成功一次（DO 串行；v6 的 levelMutate 在这里仍有毫秒级窗口）。
+    const r = await levelApply(env, username, "claim-mail", {
+      mail_id: mailId, kind,
+      amount: kind === "xp" ? Math.floor(amount) : 0,
+      title: kind === "title" ? title : "",
     });
     if (!r.ok) return json({ ok: false, error: r.error });
     const rec = r.rec;
@@ -708,7 +873,7 @@ async function handleLevelRequest(env, path, body) {
     if (!rec.bound) return json(unbound(rec));
     const partner = await levelLoad(env, rec.bound);
     if (!partner || partner.bound !== username) {
-      const healed = await levelMutate(env, username, (r) => { r.bound = ""; return null; });
+      const healed = await levelApply(env, username, "heal-unbind", {});
       return json(unbound(healed.ok ? healed.rec : rec));
     }
     const total = rec.xp + partner.xp;
@@ -744,31 +909,16 @@ async function handleLevelRequest(env, path, body) {
   // 后迁的快照（见 levelMergeMigrateRecords），写回并返回合并后记录；
   // 没有记录时照旧写快照（把 updatedAt 也存下来）。
   // 请求体可带 updatedAt（数字，毫秒时间戳；app 发 System.currentTimeMillis()）。
+  // v7：合并在 DO 内做——DO 先从 KV 懒迁移老记录（如果有），再合并快照；
+  // 同一用户两台设备同时迁，也在 DO 内串行，不会互相覆盖。
   if (path === "/migrate") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
     const ext = body.ext && typeof body.ext === "object" ? body.ext : {};
-    const rec = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "", updatedAt: 0 };
-    if (typeof ext.bound === "string") rec.bound = ext.bound;
-    if (typeof ext.xp === "number" && ext.xp >= 0) rec.xp = Math.floor(ext.xp);
-    if (isValidDateStr(ext.ck)) rec.ck = ext.ck;
-    if (isValidDateStr(ext.msgd)) rec.msgd = ext.msgd;
-    if (typeof ext.msgc === "number" && ext.msgc >= 0) rec.msgc = Math.floor(ext.msgc);
-    if (Array.isArray(ext.stitles)) rec.stitles = ext.stitles.filter((t) => typeof t === "string");
-    if (Array.isArray(ext.cmail)) rec.cmail = ext.cmail.slice(-LEVEL_MAX_CLAIMED_MAIL_IDS).filter((t) => typeof t === "string");
-    if (typeof ext.dtitle === "string") rec.dtitle = ext.dtitle;
-    if (typeof body.updatedAt === "number" && body.updatedAt >= 0) rec.updatedAt = Math.floor(body.updatedAt);
-    const existingRaw = await env.LEVEL_KV.get("u:" + username);
-    if (existingRaw) {
-      try {
-        const existing = parseLevelRecord(existingRaw);
-        const merged = levelMergeMigrateRecords(existing, rec);
-        await levelSave(env, username, merged);
-        return json({ ok: true, migrated: false, merged: true, record: merged });
-      } catch { /* 坏记录就按没有处理，继续写快照 */ }
-    }
-    await levelSave(env, username, rec);
-    return json({ ok: true, migrated: true, record: rec });
+    const updatedAt = (typeof body.updatedAt === "number" && body.updatedAt >= 0) ? Math.floor(body.updatedAt) : 0;
+    const r = await levelApply(env, username, "migrate", { ext, updatedAt });
+    if (!r.ok) return json({ ok: false, error: r.error });
+    return json({ ok: true, migrated: r.migrated, merged: r.merged, record: r.rec });
   }
 
   // ----- POST /level/bind：把绑定写进服务器 KV（v5 补 B-1） -----
@@ -781,7 +931,7 @@ async function handleLevelRequest(env, path, body) {
     const partner = (body.partner || "").trim();
     if (!partner || partner === username) return json({ ok: false, error: "对方用户名不对" }, 400);
     if (!/^[a-z][a-z0-9_-]{0,63}$/.test(partner)) return json({ ok: false, error: "对方用户名不对" }, 400);
-    const r = await levelMutate(env, username, (rec) => { rec.bound = partner; return null; });
+    const r = await levelApply(env, username, "bind", { partner });
     if (!r.ok) return json({ ok: false, error: r.error });
     return json({ ok: true, bound: partner });
   }
@@ -790,23 +940,13 @@ async function handleLevelRequest(env, path, body) {
   if (path === "/unbind") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
-    let partnerName = "";
-    const r = await levelMutate(env, username, (rec) => {
-      partnerName = rec.bound;
-      rec.bound = "";
-      rec.xp = 0;
-      rec.ck = "";
-      rec.msgd = "";
-      rec.msgc = 0;
-      if (rec.stitles.indexOf(rec.dtitle) === -1) rec.dtitle = "";
-      return null;
-    });
+    const r = await levelApply(env, username, "unbind", {});
     if (!r.ok) return json({ ok: false, error: r.error });
+    const partnerName = r.partner || "";
     if (partnerName) {
       const partner = await levelLoad(env, partnerName);
       if (partner.bound === username) {
-        partner.bound = "";
-        await levelSave(env, partnerName, partner);
+        await levelApply(env, partnerName, "clear-bound-if", { by: username });
       }
     }
     return json({ ok: true });
