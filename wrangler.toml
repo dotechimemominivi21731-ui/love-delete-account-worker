@@ -1,11 +1,7 @@
-name = "love-delete-account"
+name = "love-deploy-test"
 main = "worker.js"
 compatibility_date = "2026-11-06"
 
 [[kv_namespaces]]
-binding = "IDEM_KV"
-id = "bbca085bcb564bf3a57375b373f7c524"
-
-[[kv_namespaces]]
-binding = "LEVEL_KV"
-id = "2d8f6cb816814df89742dd407b8ca074"
+binding = "TEST_KV"
+id = "2ccd2b9c0da94ceb910791dd5e22cc46"
