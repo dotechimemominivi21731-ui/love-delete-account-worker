@@ -11,6 +11,7 @@
 //     /level/send-announcement 管理员发公告 (服务器验管理员身份 + 60 秒去重)
 //     /level/get-couple       查情侣状态 (双向绑定校验, 未绑定/单向绑定自动自愈)
 //     /level/migrate          首次把手机 EXT 里的等级快照迁到服务器 (先写者胜)
+//     /level/bind             绑定 (v5：把 bound 写进服务器 KV，补 B-1)
 //     /level/unbind           解绑 (等级清零, 特殊称号保留)
 //   level 接口一律 POST JSON { username, password, ... }，密码用环信登录校验；
 //   路径可带 /level 前缀也可不带（代理会去掉前缀再转发，两种都认）。
@@ -27,8 +28,10 @@
 // 而 Client Secret 的值只存在 Worker secret 里、谁也不知道, 写不上;
 // 不声明 bindings 又会把已有的 4 个 secret 全删掉。2026-11-08 已用一次
 // 性测试 Worker 实测确认: 带 bindings 声明重部署报 10021, 行不通。
-// 所以这个文件的部署只能用 Cloudflare Dashboard 的 Quick Editor 粘贴保存
-// (Dashboard 编辑会保留已有 Secrets, 2026-11-07 的部署就是这么做的)。
+// 部署走 GitHub 自动部署: 仓库 love-delete-account-worker (main 分支)，
+// Cloudflare 上已接好 Git 连接，推 main 就自动部署；Git 部署会保留
+// Secrets（2026-11-10 实测），KV 绑定以 wrangler.toml 为准——
+// 想加绑定必须写进 wrangler.toml，Dashboard 上单独绑的会被下次部署删掉。
 // 新加的 ADMIN_KEY 也要在 Dashboard > Settings > Variables 里新建一个
 // Secret (值就是邀请码 Worker 的那个管理密钥, 用户手里有), 不要写进代码。
 //
@@ -36,6 +39,24 @@
 // app 因网络问题重试时，先查缓存——缓存命中且环信那边已查无此人，
 // 就直接返回上次的成功结果，不再重复删；同名新账号仍在则走正常流程。
 // 失败的结果不缓存，重试会重新走流程。app 不用改，重试逻辑本来就有。
+//
+// v5 (2026-11-10) 审计 v10.0-v2.1 的修复：
+//   B-2：/level/send-mail 发成功后把邮件登记进 KV（mail:<mail_id>），
+//     /level/claim-mail 按登记表验真——不存在、kind/金额/称号/收件人
+//     对不上的直接拒绝，改过客户端再也凭空刷不了经验和称号。
+//     注意：v5 上线前经 v4 发出的邮件没有登记，领时会报“不存在”，
+//     属一次性代价（v4 才上线两天，实际发出的邮件极少）。
+//   B-1：新增 POST /level/bind，绑定成功后 app 调它把 bound 写进 KV；
+//     否则新绑定永远写不到服务器，get-couple 报未绑定还会把本地绑定清掉。
+//   B-3：/level/get-couple 未绑定时也返回 myXp/level/title/checkedInToday/
+//     msgCountToday，app 不再拿 myXp=0 覆盖本地经验。
+//   M-13：/level/send-mail 接受可选 idempotency_key，10 分钟内同 key
+//     重试直接返回原来那封的 mail_id，不再重发（app v10.1 开始传）。
+//   M-15：服务器日期固定按 Asia/Shanghai 算，不再信任客户端传的 tz
+//     （改过客户端轮换 tz 可多签到；用户在中国，app 的 tz 本来就是上海）。
+//   M-16：改记录的接口走 levelMutate（读-改-写前再读一次比对，变了就
+//     在新记录上重做一次），并发丢更新的窗口缩到毫秒级；KV 没有 CAS，
+//     彻底修要上 Durable Object，不做，残余窗口如实记录。
 //
 // v4 (2026-11-09) B1/B2/B4/M24：等级/经验/签到/领邮件改由服务器说了算。
 // 以前这些存在每个人自己的环信 EXT 里、手机端自己写，改过的客户端能
@@ -69,7 +90,7 @@
 
 //   Body JSON: { "admin_key": "<管理员密钥>", "username": "<要删的用户名>" }
 //   返回: { "ok": true, "deleted": "<用户名>" } 或 { "ok": false, "error": "原因" }
-// 接口: POST /level/* (v4，见文件头；一律带 { username, password }，路径可带 /level 前缀也可不带)
+// 接口: POST /level/* (v5，见文件头；一律带 { username, password }，路径可带 /level 前缀也可不带)
 
 const BASE = (env) => `https://ngi-a1.easemob.com/${env.EASEMOB_ORG}/${env.EASEMOB_APP}`;
 // 环信免费测试版上限 100 个注册账号 (2026-11-07 控制台查到已注册 2 个, 剩 98 个)。
@@ -192,6 +213,8 @@ async function idemReplay(env, kind, username) {
 // KV 模型（love-level，变量名 LEVEL_KV）：
 //   u:<username> → { bound, xp, ck, msgd, msgc, stitles[], cmail[]（最近 100 个）, dtitle }
 //   ann:<sha256(标题+"\n"+内容)> → { at }（公告去重，60 秒过期）
+//   mail:<mail_id> → { kind, amount|title, scope, to, from, createdAt }（v5：发邮件登记，领邮件时验真；不设过期，管理员发的邮件量很小）
+//   idem-mail:<idempotency_key> → { mail_id }（v5：发邮件幂等，10 分钟过期）
 // 等级曲线和称号表和 app 里 CoupleLevel 一模一样：
 //   LV.n 升 LV.n+1 要 100+(n-1)*20 XP；升到 LV.L 总共要 10*(L-1)*(L+8) XP；最高 18 级。
 const LEVEL_TITLES = [
@@ -225,11 +248,13 @@ function levelTitleFor(level) {
   return LEVEL_TITLES[level - 1];
 }
 
-// 服务器今天的日期（按 app 传来的时区算；时区不对返回 null）。
-function serverDateInTz(tz) {
+// 服务器今天的日期（v5：固定按 Asia/Shanghai 算，不再信任客户端传的 tz。
+// M-15：改过客户端轮换 tz（如 UTC+14 与 UTC-12）可在同一自然日拿到两个
+// 服务器日期，多签一次到；用户在中国，app 的 tz 本来就是上海，固定上海无影响）。
+function serverDateInTz() {
   try {
     const fmt = new Intl.DateTimeFormat("en-CA", {
-      timeZone: tz || "Asia/Shanghai",
+      timeZone: "Asia/Shanghai",
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -244,13 +269,11 @@ function isValidDateStr(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s));
 }
 
-// 读一条等级记录；没有就给一份空的（不写回，等真正改了再写）。
-async function levelLoad(env, username) {
+// 把一条 KV 原始 JSON 解析成等级记录；没有/坏了就给一份空的。
+function parseLevelRecord(raw) {
   const rec = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "" };
-  if (!env.LEVEL_KV) return rec;
+  if (!raw) return rec;
   try {
-    const raw = await env.LEVEL_KV.get("u:" + username);
-    if (!raw) return rec;
     const j = JSON.parse(raw);
     if (typeof j.bound === "string") rec.bound = j.bound;
     if (typeof j.xp === "number" && j.xp >= 0) rec.xp = Math.floor(j.xp);
@@ -264,9 +287,41 @@ async function levelLoad(env, username) {
   return rec;
 }
 
+// 读一条等级记录；没有就给一份空的（不写回，等真正改了再写）。
+async function levelLoad(env, username) {
+  if (!env.LEVEL_KV) return parseLevelRecord(null);
+  try {
+    const raw = await env.LEVEL_KV.get("u:" + username);
+    return parseLevelRecord(raw);
+  } catch { return parseLevelRecord(null); }
+}
+
 async function levelSave(env, username, rec) {
   if (!env.LEVEL_KV) return;
   await env.LEVEL_KV.put("u:" + username, JSON.stringify(rec));
+}
+
+// v5 M-16：KV 没有 CAS/事务，读-改-写并发会丢更新。
+// 缓解：改记录的接口都走 levelMutate——读、改、写前再读一次比对，
+// 期间有人写过就在新记录上重做一次改动再写。窗口从"整个请求"
+// （含环信密码校验的网络往返）缩到"一次 KV 读 + 一次写"的毫秒级。
+// 彻底修要上 Durable Object，太重，不做；残余窗口如实记录。
+// fn(rec) 是纯改动：改 rec 的字段；返回 null 表示成功，返回错误字符串
+// 表示本次改动不成立（如已签到/已领过），此时不写回。
+// 返回 { ok: true, rec }（写回后的记录）或 { ok: false, error }。
+async function levelMutate(env, username, fn) {
+  const raw1 = await env.LEVEL_KV.get("u:" + username);
+  let rec = parseLevelRecord(raw1);
+  let err = fn(rec);
+  if (err) return { ok: false, error: err };
+  const raw2 = await env.LEVEL_KV.get("u:" + username);
+  if (raw2 !== raw1) {
+    rec = parseLevelRecord(raw2);
+    err = fn(rec);
+    if (err) return { ok: false, error: err };
+  }
+  await levelSave(env, username, rec);
+  return { ok: true, rec };
 }
 
 // 情侣总分 = 我 + 对方（对方记录也指回我才算，否则只算我自己的）。
@@ -348,16 +403,19 @@ async function handleLevelRequest(env, path, body) {
   if (path === "/checkin") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
-    const d = serverDateInTz(body.tz);
-    if (!d) return json({ ok: false, error: "时区不对" }, 400);
+    const d = serverDateInTz();
+    if (!d) return json({ ok: false, error: "服务器日期算不出来" }, 400);
     if (typeof body.today === "string" && body.today !== d) {
       return json({ ok: false, error: "日期对不上，请检查手机时间" }, 400);
     }
-    const rec = await levelLoad(env, username);
-    if (rec.ck === d) return json({ ok: false, error: "今天已经签到过了" });
-    rec.xp += LEVEL_CHECKIN_XP;
-    rec.ck = d;
-    await levelSave(env, username, rec);
+    const r = await levelMutate(env, username, (rec) => {
+      if (rec.ck === d) return "今天已经签到过了";
+      rec.xp += LEVEL_CHECKIN_XP;
+      rec.ck = d;
+      return null;
+    });
+    if (!r.ok) return json({ ok: false, error: r.error });
+    const rec = r.rec;
     const total = await levelCoupleTotal(env, rec, username);
     const level = levelForXp(total);
     return json({ ok: true, xp: rec.xp, totalXp: total, level: level, title: levelTitleFor(level), checkedInToday: true });
@@ -367,8 +425,8 @@ async function handleLevelRequest(env, path, body) {
   if (path === "/add-xp") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
-    const d = serverDateInTz(body.tz);
-    if (!d) return json({ ok: false, error: "时区不对" }, 400);
+    const d = serverDateInTz();
+    if (!d) return json({ ok: false, error: "服务器日期算不出来" }, 400);
     if (typeof body.today === "string" && body.today !== d) {
       return json({ ok: false, error: "日期对不上，请检查手机时间" }, 400);
     }
@@ -376,17 +434,23 @@ async function handleLevelRequest(env, path, body) {
     if (!rec.bound) return json({ ok: false, error: "还没有绑定情侣" });
     const partner = await levelLoad(env, rec.bound);
     if (partner.bound !== username) return json({ ok: false, error: "还没有绑定情侣" });
-    if (rec.msgd !== d) { rec.msgd = d; rec.msgc = 0; }
+    // counted 在闭包里：fn 可能因重试跑两次，每次开头先清零，
+    // 最终值以实际写回的那次为准。
     let counted = false;
-    if (rec.msgc < LEVEL_MESSAGE_DAILY_MAX) {
-      rec.msgc += 1;
-      rec.xp += LEVEL_MESSAGE_XP;
-      counted = true;
-    }
-    await levelSave(env, username, rec);
-    const total = rec.xp + partner.xp;
+    const r = await levelMutate(env, username, (m) => {
+      counted = false;
+      if (m.msgd !== d) { m.msgd = d; m.msgc = 0; }
+      if (m.msgc < LEVEL_MESSAGE_DAILY_MAX) {
+        m.msgc += 1;
+        m.xp += LEVEL_MESSAGE_XP;
+        counted = true;
+      }
+      return null;
+    });
+    if (!r.ok) return json({ ok: false, error: r.error });
+    const total = r.rec.xp + partner.xp;
     const level = levelForXp(total);
-    return json({ ok: true, xp: rec.xp, totalXp: total, level: level, title: levelTitleFor(level), counted: counted });
+    return json({ ok: true, xp: r.rec.xp, totalXp: total, level: level, title: levelTitleFor(level), counted: counted });
   }
 
   // ----- POST /level/claim-mail：领邮件（服务器判重，同一封只能领一次） -----
@@ -397,26 +461,40 @@ async function handleLevelRequest(env, path, body) {
     const kind = body.kind;
     if (!mailId) return json({ ok: false, error: "缺少 mail_id" }, 400);
     if (kind !== "xp" && kind !== "title") return json({ ok: false, error: "邮件类型不对" }, 400);
-    const rec = await levelLoad(env, username);
-    if (rec.cmail.indexOf(mailId) !== -1) return json({ ok: false, error: "已经领过了" });
-    if (kind === "xp") {
-      const amount = body.amount;
-      if (typeof amount !== "number" || amount < 1 || amount > LEVEL_MAX_MAIL_XP) {
-        return json({ ok: false, error: "经验数量不对" }, 400);
-      }
-      rec.xp += Math.floor(amount);
-    } else {
-      const title = (body.title || "").trim();
-      if (!title || title.length > LEVEL_MAX_TITLE_LEN) {
-        return json({ ok: false, error: "称号不对" }, 400);
-      }
-      if (rec.stitles.indexOf(title) === -1) rec.stitles.push(title);
+    const amount = body.amount;
+    const title = (body.title || "").trim();
+    if (kind === "xp" && (typeof amount !== "number" || amount < 1 || amount > LEVEL_MAX_MAIL_XP)) {
+      return json({ ok: false, error: "经验数量不对" }, 400);
     }
-    rec.cmail.push(mailId);
-    if (rec.cmail.length > LEVEL_MAX_CLAIMED_MAIL_IDS) {
-      rec.cmail = rec.cmail.slice(rec.cmail.length - LEVEL_MAX_CLAIMED_MAIL_IDS);
+    if (kind === "title" && (!title || title.length > LEVEL_MAX_TITLE_LEN)) {
+      return json({ ok: false, error: "称号不对" }, 400);
     }
-    await levelSave(env, username, rec);
+    // v5 B-2：先查邮件登记表——mail_id 必须是管理员经 /level/send-mail
+    // 真发过的，且 kind/金额/称号/收件人要和登记时一致，否则就是凭空伪造。
+    // v5 上线前经 v4 发出的邮件没有登记，领时会报“不存在”，属一次性代价。
+    const mailRaw = await env.LEVEL_KV.get("mail:" + mailId);
+    if (!mailRaw) return json({ ok: false, error: "这封邮件不存在或已失效" });
+    let mail;
+    try { mail = JSON.parse(mailRaw); } catch { return json({ ok: false, error: "这封邮件不存在或已失效" }); }
+    if (!mail || mail.kind !== kind) return json({ ok: false, error: "邮件内容对不上" });
+    if (kind === "xp" && mail.amount !== Math.floor(amount)) return json({ ok: false, error: "邮件内容对不上" });
+    if (kind === "title" && mail.title !== title) return json({ ok: false, error: "邮件内容对不上" });
+    if (mail.scope === "one" && mail.to && mail.to !== username) return json({ ok: false, error: "这封邮件不是发给你的" });
+    const r = await levelMutate(env, username, (rec) => {
+      if (rec.cmail.indexOf(mailId) !== -1) return "已经领过了";
+      if (kind === "xp") {
+        rec.xp += Math.floor(amount);
+      } else {
+        if (rec.stitles.indexOf(title) === -1) rec.stitles.push(title);
+      }
+      rec.cmail.push(mailId);
+      if (rec.cmail.length > LEVEL_MAX_CLAIMED_MAIL_IDS) {
+        rec.cmail = rec.cmail.slice(rec.cmail.length - LEVEL_MAX_CLAIMED_MAIL_IDS);
+      }
+      return null;
+    });
+    if (!r.ok) return json({ ok: false, error: r.error });
+    const rec = r.rec;
     const total = await levelCoupleTotal(env, rec, username);
     const level = levelForXp(total);
     return json({ ok: true, xp: rec.xp, totalXp: total, level: level, title: levelTitleFor(level), titles: rec.stitles });
@@ -433,6 +511,8 @@ async function handleLevelRequest(env, path, body) {
     const amount = body.amount;
     const title = (body.title || "").trim();
     const note = (body.note || "").trim();
+    // v5 M-13：可选幂等键（app v10.1 开始传，UUID；重试时复用同一把 key）。
+    const idemKey = typeof body.idempotency_key === "string" ? body.idempotency_key.trim().slice(0, 128) : "";
     if (!groupId) return json({ ok: false, error: "缺少 group_id" }, 400);
     if (scope !== "all" && scope !== "one") return json({ ok: false, error: "scope 不对" }, 400);
     if (kind !== "xp" && kind !== "title") return json({ ok: false, error: "邮件类型不对" }, 400);
@@ -453,7 +533,25 @@ async function handleLevelRequest(env, path, body) {
       const appToken = await getAppToken(env);
       const isAdmin = await levelVerifyGroupOwner(env, appToken, groupId, username);
       if (!isAdmin) return json({ ok: false, error: "只有管理员可以发邮件" }, 403);
+      // v5 M-13：同 key 10 分钟内重试，直接返回原来那封，不再重发。
+      if (idemKey) {
+        const priorRaw = await env.LEVEL_KV.get("idem-mail:" + idemKey);
+        if (priorRaw) {
+          try {
+            const prior = JSON.parse(priorRaw);
+            if (prior && prior.mail_id) return json({ ok: true, mail_id: prior.mail_id, replayed: true });
+          } catch { /* 坏记录就继续正常发 */ }
+        }
+      }
       const mailId = crypto.randomUUID();
+      // v5 B-2：先把邮件登记进 KV 再发消息——发完响应丢了，收件人仍能凭
+      // mail_id 领到；若发消息失败，记录只是孤儿（mail_id 是随机 UUID，
+      // 没人猜得到），无害。
+      const mailRecord = { kind: kind, scope: scope, from: username, createdAt: Date.now() };
+      if (kind === "xp") mailRecord.amount = Math.floor(amount);
+      if (kind === "title") mailRecord.title = title;
+      if (scope === "one") mailRecord.to = to;
+      await env.LEVEL_KV.put("mail:" + mailId, JSON.stringify(mailRecord));
       let msgBody;
       if (kind === "title") {
         msgBody = "📬 邮件：管理员授予你称号「" + title + "」" + (note ? "\n" + note : "");
@@ -469,6 +567,12 @@ async function handleLevelRequest(env, path, body) {
         await levelSendEasemobMessage(env, appToken, "chatgroups", groupId, msgBody, username, ext);
       } else {
         await levelSendEasemobMessage(env, appToken, "users", to, msgBody, username, ext);
+      }
+      // v5 M-13：发成功后记下幂等键（10 分钟过期）。
+      if (idemKey) {
+        try {
+          await env.LEVEL_KV.put("idem-mail:" + idemKey, JSON.stringify({ mail_id: mailId }), { expirationTtl: 600 });
+        } catch { /* 记幂等键失败不影响已发出的邮件 */ }
       }
       return json({ ok: true, mail_id: mailId });
     } catch (e) {
@@ -508,14 +612,23 @@ async function handleLevelRequest(env, path, body) {
   if (path === "/get-couple") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
-    const d = serverDateInTz(body.tz);
+    const d = serverDateInTz();
     const rec = await levelLoad(env, username);
-    if (!rec.bound) return json({ ok: true, bound: false });
+    // v5 B-3：未绑定也返回本人经验/等级/签到状态，app 不再拿 myXp=0 覆盖本地。
+    const unbound = (r) => {
+      const lv = levelForXp(r.xp);
+      return {
+        ok: true, bound: false,
+        myXp: r.xp, level: lv, title: levelTitleFor(lv),
+        checkedInToday: d ? r.ck === d : false,
+        msgCountToday: d && r.msgd === d ? r.msgc : 0,
+      };
+    };
+    if (!rec.bound) return json(unbound(rec));
     const partner = await levelLoad(env, rec.bound);
     if (!partner || partner.bound !== username) {
-      rec.bound = "";
-      await levelSave(env, username, rec);
-      return json({ ok: true, bound: false });
+      const healed = await levelMutate(env, username, (r) => { r.bound = ""; return null; });
+      return json(unbound(healed.ok ? healed.rec : rec));
     }
     const total = rec.xp + partner.xp;
     const level = levelForXp(total);
@@ -553,19 +666,37 @@ async function handleLevelRequest(env, path, body) {
     return json({ ok: true, migrated: true, record: rec });
   }
 
+  // ----- POST /level/bind：把绑定写进服务器 KV（v5 补 B-1） -----
+  // 触发：app 在绑定接受成功后调（v10.1 起）；只验对方用户名格式，
+  // 不验对方是否存在/是否指回我——get-couple 的双向校验会兜底
+  // （对方不指回我就自愈清掉）。
+  if (path === "/bind") {
+    const username = await levelVerify(env, body);
+    if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
+    const partner = (body.partner || "").trim();
+    if (!partner || partner === username) return json({ ok: false, error: "对方用户名不对" }, 400);
+    if (!/^[a-z][a-z0-9_-]{0,63}$/.test(partner)) return json({ ok: false, error: "对方用户名不对" }, 400);
+    const r = await levelMutate(env, username, (rec) => { rec.bound = partner; return null; });
+    if (!r.ok) return json({ ok: false, error: r.error });
+    return json({ ok: true, bound: partner });
+  }
+
   // ----- POST /level/unbind：解绑（等级清零，特殊称号保留） -----
   if (path === "/unbind") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
-    const rec = await levelLoad(env, username);
-    const partnerName = rec.bound;
-    rec.bound = "";
-    rec.xp = 0;
-    rec.ck = "";
-    rec.msgd = "";
-    rec.msgc = 0;
-    if (rec.stitles.indexOf(rec.dtitle) === -1) rec.dtitle = "";
-    await levelSave(env, username, rec);
+    let partnerName = "";
+    const r = await levelMutate(env, username, (rec) => {
+      partnerName = rec.bound;
+      rec.bound = "";
+      rec.xp = 0;
+      rec.ck = "";
+      rec.msgd = "";
+      rec.msgc = 0;
+      if (rec.stitles.indexOf(rec.dtitle) === -1) rec.dtitle = "";
+      return null;
+    });
+    if (!r.ok) return json({ ok: false, error: r.error });
     if (partnerName) {
       const partner = await levelLoad(env, partnerName);
       if (partner.bound === username) {
@@ -593,7 +724,8 @@ export default {
     if (levelPath.startsWith("/level/")) levelPath = levelPath.slice("/level".length);
     if (levelPath === "/checkin" || levelPath === "/add-xp" || levelPath === "/claim-mail"
       || levelPath === "/send-mail" || levelPath === "/send-announcement"
-      || levelPath === "/get-couple" || levelPath === "/migrate" || levelPath === "/unbind") {
+      || levelPath === "/get-couple" || levelPath === "/migrate" || levelPath === "/unbind"
+      || levelPath === "/bind") {
       let levelBody;
       try {
         levelBody = await request.json();
