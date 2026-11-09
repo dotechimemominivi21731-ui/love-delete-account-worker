@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v4
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v6
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -10,7 +10,8 @@
 //     /level/send-mail        管理员发邮件 (服务器验管理员身份, 再调环信发消息)
 //     /level/send-announcement 管理员发公告 (服务器验管理员身份 + 60 秒去重)
 //     /level/get-couple       查情侣状态 (双向绑定校验, 未绑定/单向绑定自动自愈)
-//     /level/migrate          首次把手机 EXT 里的等级快照迁到服务器 (先写者胜)
+//     /level/get-other        查别人的等级 (只读, 供好友行徽章用, v6 新增)
+//     /level/migrate          首次把手机 EXT 里的等级快照迁到服务器 (已有记录时按字段合并, v6)
 //     /level/bind             绑定 (v5：把 bound 写进服务器 KV，补 B-1)
 //     /level/unbind           解绑 (等级清零, 特殊称号保留)
 //   level 接口一律 POST JSON { username, password, ... }，密码用环信登录校验；
@@ -39,6 +40,31 @@
 // app 因网络问题重试时，先查缓存——缓存命中且环信那边已查无此人，
 // 就直接返回上次的成功结果，不再重复删；同名新账号仍在则走正常流程。
 // 失败的结果不缓存，重试会重新走流程。app 不用改，重试逻辑本来就有。
+//
+// v6 (2026-11-10) 审计 v10.0-v2.1 的第二批修复：
+//   M-17：cmail 上限从 100 提到 1000（LEVEL_MAX_CLAIMED_MAIL_IDS），
+//     claim-mail 截断和 migrate 的 slice 都走这个常量；app 那边
+//     CoupleLevel.MAX_CLAIMED_MAIL_IDS 也要同步改成 1000。
+//   M-28：/level/migrate 不再先写者胜——服务器已有记录时按字段合并
+//     后迁的快照（xp 取大、ck 取晚、msgd/msgc 取晚、stitles/cmail
+//     并集、dtitle/bound 按规则取、updatedAt 取大），返回合并后记录；
+//     请求体可带 updatedAt（毫秒时间戳），和记录一起存下来。
+//   P-6：新增 POST /level/get-other，只读不改：验身份后读对方记录，
+//     未绑定回 {ok:true, bound:false}，已绑定回 {ok:true, bound:true,
+//     level, title, totalXp}（totalXp 照 get-couple 的算法算）。
+//   M-16：评估结论——选 (a)，保留 v5 的 levelMutate 乐观重试当缓解，
+//     记为“已知窄窗口、未彻底修”，不上 Durable Object。理由：
+//     ① KV 没有 CAS，纯 KV 做不到真正原子；DO 当锁要给 7 个改接口
+//     全套加 acquire/release + 过期 + DO 挂了全拒的 fail-closed，
+//     每个失败路径都是新风险；DO 当账本要把 live 的 u: 记录从
+//     LEVEL_KV 搬进 DO 存储，还要跨 DO 读伴侣记录算总分，
+//     是带数据迁移的大改。② M-16 的实际伤害很小：同一用户两次改动
+//     在几十毫秒内重叠才丢一次 +2/+4 XP（只丢不翻倍、不 corrupt），
+//     触发要签到后立刻发消息且恰好撞上窗口，用户量只有 3 人。
+//     ③ InviteClaim 的 DO 只守一个码的一次认领，形状简单；
+//     level 是每用户记录 × 7 个接口，不是一个量级。若以后用户量
+//     上来或真丢过经验，再单独立项做 DO 账本迁移（含回填 + 双读），
+//     不塞进 v10.2。wrangler.toml 因此不动。
 //
 // v5 (2026-11-10) 审计 v10.0-v2.1 的修复：
 //   B-2：/level/send-mail 发成功后把邮件登记进 KV（mail:<mail_id>），
@@ -211,7 +237,7 @@ async function idemReplay(env, kind, username) {
 
 // ================= v4: 情侣等级/经验/签到/邮件（服务器说了算） =================
 // KV 模型（love-level，变量名 LEVEL_KV）：
-//   u:<username> → { bound, xp, ck, msgd, msgc, stitles[], cmail[]（最近 100 个）, dtitle }
+//   u:<username> → { bound, xp, ck, msgd, msgc, stitles[], cmail[]（最近 1000 个）, dtitle, updatedAt }
 //   ann:<sha256(标题+"\n"+内容)> → { at }（公告去重，60 秒过期）
 //   mail:<mail_id> → { kind, amount|title, scope, to, from, createdAt }（v5：发邮件登记，领邮件时验真；不设过期，管理员发的邮件量很小）
 //   idem-mail:<idempotency_key> → { mail_id }（v5：发邮件幂等，10 分钟过期）
@@ -229,7 +255,7 @@ const LEVEL_MESSAGE_XP = 2;
 const LEVEL_MESSAGE_DAILY_MAX = 4;
 const LEVEL_MAX_MAIL_XP = 10000;
 const LEVEL_MAX_TITLE_LEN = 20;
-const LEVEL_MAX_CLAIMED_MAIL_IDS = 100;
+const LEVEL_MAX_CLAIMED_MAIL_IDS = 1000;
 
 function levelCumXp(level) {
   if (level <= 1) return 0;
@@ -270,8 +296,10 @@ function isValidDateStr(s) {
 }
 
 // 把一条 KV 原始 JSON 解析成等级记录；没有/坏了就给一份空的。
+// updatedAt（v6）：快照的毫秒时间戳，migrate 合并时取两边较大值存下来；
+// 老记录没有这个字段时按 0 处理。
 function parseLevelRecord(raw) {
-  const rec = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "" };
+  const rec = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "", updatedAt: 0 };
   if (!raw) return rec;
   try {
     const j = JSON.parse(raw);
@@ -283,6 +311,7 @@ function parseLevelRecord(raw) {
     if (Array.isArray(j.stitles)) rec.stitles = j.stitles.filter((t) => typeof t === "string");
     if (Array.isArray(j.cmail)) rec.cmail = j.cmail.filter((t) => typeof t === "string");
     if (typeof j.dtitle === "string") rec.dtitle = j.dtitle;
+    if (typeof j.updatedAt === "number" && j.updatedAt >= 0) rec.updatedAt = Math.floor(j.updatedAt);
   } catch { /* 读坏了就按空记录走，不崩 */ }
   return rec;
 }
@@ -305,7 +334,9 @@ async function levelSave(env, username, rec) {
 // 缓解：改记录的接口都走 levelMutate——读、改、写前再读一次比对，
 // 期间有人写过就在新记录上重做一次改动再写。窗口从"整个请求"
 // （含环信密码校验的网络往返）缩到"一次 KV 读 + 一次写"的毫秒级。
-// 彻底修要上 Durable Object，太重，不做；残余窗口如实记录。
+// v6 评估结论：彻底修要上 Durable Object（当锁或当账本），改动面大、
+// 还要搬 live 数据，风险不可控，而实际伤害只是偶丢一次 +2/+4 XP；
+// 选 (a) 保留本缓解，M-16 记为“已知窄窗口、未彻底修”，详见文件头 v6。
 // fn(rec) 是纯改动：改 rec 的字段；返回 null 表示成功，返回错误字符串
 // 表示本次改动不成立（如已签到/已领过），此时不写回。
 // 返回 { ok: true, rec }（写回后的记录）或 { ok: false, error }。
@@ -391,6 +422,56 @@ async function levelSendEasemobMessage(env, appToken, targetType, target, body, 
 async function levelSha256Hex(text) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// v6 M-28：双设备迁移合并。服务器已有记录时不再直接丢弃后迁的快照，
+// 而是按字段合并，返回合并后的记录：
+//   xp 取两边较大值；ck 取较晚的日期（YYYY-MM-DD 字符串直接比大小）；
+//   msgd/msgc 取 msgd 较晚的那份（相等取 msgc 较大值）；
+//   stitles 取并集去重；cmail 取并集去重、留最近 1000 个；
+//   dtitle 用快照的（如果它在合并后的 stitles 里），否则保留服务器的；
+//   bound 用快照的（如果非空），否则保留服务器的（解绑走 /level/unbind
+//     直接清服务器，快照里 bound 为空只是旧缓存，不是解绑意图）；
+//   updatedAt 取两边较大值。
+// 合并是幂等的：同一份快照迁两次，结果不变。
+function levelMergeMigrateRecords(server, snap) {
+  const merged = {
+    bound: snap.bound ? snap.bound : server.bound,
+    xp: Math.max(server.xp, snap.xp),
+    ck: snap.ck > server.ck ? snap.ck : server.ck,
+    msgd: "",
+    msgc: 0,
+    stitles: [],
+    cmail: [],
+    dtitle: "",
+    updatedAt: Math.max(server.updatedAt || 0, snap.updatedAt || 0),
+  };
+  if (snap.msgd > server.msgd) {
+    merged.msgd = snap.msgd;
+    merged.msgc = snap.msgc;
+  } else if (snap.msgd < server.msgd) {
+    merged.msgd = server.msgd;
+    merged.msgc = server.msgc;
+  } else {
+    merged.msgd = server.msgd;
+    merged.msgc = Math.max(server.msgc, snap.msgc);
+  }
+  merged.stitles = [...server.stitles];
+  for (const t of snap.stitles) {
+    if (merged.stitles.indexOf(t) === -1) merged.stitles.push(t);
+  }
+  const seenMail = new Set();
+  const cmail = [];
+  for (const m of [...server.cmail, ...snap.cmail]) {
+    if (!seenMail.has(m)) { seenMail.add(m); cmail.push(m); }
+  }
+  merged.cmail = cmail.length > LEVEL_MAX_CLAIMED_MAIL_IDS
+    ? cmail.slice(cmail.length - LEVEL_MAX_CLAIMED_MAIL_IDS)
+    : cmail;
+  merged.dtitle = (snap.dtitle && merged.stitles.indexOf(snap.dtitle) !== -1)
+    ? snap.dtitle
+    : server.dtitle;
+  return merged;
 }
 
 // ---------- /level/* 各接口（body 已解析好） ----------
@@ -641,19 +722,33 @@ async function handleLevelRequest(env, path, body) {
     });
   }
 
-  // ----- POST /level/migrate：首次把手机 EXT 里的等级快照迁到服务器（先写者胜） -----
+  // ----- POST /level/get-other：查别人的等级（只读，供好友行徽章用，v6 P-6） -----
+  // 只读不改数据，不做自愈（对方单向绑定不由我来清）。
+  // 对方没有记录或未绑定 → {ok:true, bound:false}；
+  // 对方已绑定 → {ok:true, bound:true, level, title, totalXp}，
+  // totalXp 照 get-couple 的算法算（对方 xp + 其伴侣 xp，伴侣不指回对方时只算对方的）。
+  if (path === "/get-other") {
+    const username = await levelVerify(env, body);
+    if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
+    const other = (body.other || "").trim();
+    if (!other || !/^[a-z][a-z0-9_-]{0,63}$/.test(other)) return json({ ok: false, error: "对方用户名不对" }, 400);
+    const rec = await levelLoad(env, other);
+    if (!rec.bound) return json({ ok: true, bound: false });
+    const total = await levelCoupleTotal(env, rec, other);
+    const level = levelForXp(total);
+    return json({ ok: true, bound: true, level: level, title: levelTitleFor(level), totalXp: total });
+  }
+
+  // ----- POST /level/migrate：首次把手机 EXT 里的等级快照迁到服务器 -----
+  // v6 M-28：服务器已有记录时不再先写者胜直接返回，而是按字段合并
+  // 后迁的快照（见 levelMergeMigrateRecords），写回并返回合并后记录；
+  // 没有记录时照旧写快照（把 updatedAt 也存下来）。
+  // 请求体可带 updatedAt（数字，毫秒时间戳；app 发 System.currentTimeMillis()）。
   if (path === "/migrate") {
     const username = await levelVerify(env, body);
     if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
-    const existingRaw = await env.LEVEL_KV.get("u:" + username);
-    if (existingRaw) {
-      try {
-        const existing = JSON.parse(existingRaw);
-        return json({ ok: true, migrated: false, record: existing });
-      } catch { /* 坏记录就按没有处理，继续写 */ }
-    }
     const ext = body.ext && typeof body.ext === "object" ? body.ext : {};
-    const rec = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "" };
+    const rec = { bound: "", xp: 0, ck: "", msgd: "", msgc: 0, stitles: [], cmail: [], dtitle: "", updatedAt: 0 };
     if (typeof ext.bound === "string") rec.bound = ext.bound;
     if (typeof ext.xp === "number" && ext.xp >= 0) rec.xp = Math.floor(ext.xp);
     if (isValidDateStr(ext.ck)) rec.ck = ext.ck;
@@ -662,6 +757,16 @@ async function handleLevelRequest(env, path, body) {
     if (Array.isArray(ext.stitles)) rec.stitles = ext.stitles.filter((t) => typeof t === "string");
     if (Array.isArray(ext.cmail)) rec.cmail = ext.cmail.slice(-LEVEL_MAX_CLAIMED_MAIL_IDS).filter((t) => typeof t === "string");
     if (typeof ext.dtitle === "string") rec.dtitle = ext.dtitle;
+    if (typeof body.updatedAt === "number" && body.updatedAt >= 0) rec.updatedAt = Math.floor(body.updatedAt);
+    const existingRaw = await env.LEVEL_KV.get("u:" + username);
+    if (existingRaw) {
+      try {
+        const existing = parseLevelRecord(existingRaw);
+        const merged = levelMergeMigrateRecords(existing, rec);
+        await levelSave(env, username, merged);
+        return json({ ok: true, migrated: false, merged: true, record: merged });
+      } catch { /* 坏记录就按没有处理，继续写快照 */ }
+    }
     await levelSave(env, username, rec);
     return json({ ok: true, migrated: true, record: rec });
   }
@@ -724,7 +829,7 @@ export default {
     if (levelPath.startsWith("/level/")) levelPath = levelPath.slice("/level".length);
     if (levelPath === "/checkin" || levelPath === "/add-xp" || levelPath === "/claim-mail"
       || levelPath === "/send-mail" || levelPath === "/send-announcement"
-      || levelPath === "/get-couple" || levelPath === "/migrate" || levelPath === "/unbind"
+      || levelPath === "/get-couple" || levelPath === "/get-other" || levelPath === "/migrate" || levelPath === "/unbind"
       || levelPath === "/bind") {
       let levelBody;
       try {
