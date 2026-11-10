@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v8
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v9
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -411,6 +411,9 @@ async function levelVerify(env, body) {
 // 返回 { isOwner, groupname }：groupname 供 /level/send-announcement 校验
 // “只能发到系统公告群”（v8）。环信返回的 data 可能是对象也可能是数组，
 // owner 和 groupname 都按两种形状取。
+// v9 修正：环信群详情接口的群名字段不固定（有的返回 groupname，有的返回
+// name），两个都试；取不到群名时返回 ""，调用方不得仅凭 "" 就拦截
+// （v8 的教训：只认 groupname 时，取不到就把正确群也 403 了）。
 async function levelVerifyGroupOwner(env, appToken, groupId, username) {
   const r = await fetch(`${BASE(env)}/chatgroups/${encodeURIComponent(groupId)}`, {
     headers: { Authorization: "Bearer " + appToken },
@@ -422,9 +425,12 @@ async function levelVerifyGroupOwner(env, appToken, groupId, username) {
     const info = data && typeof data === "object" && !Array.isArray(data)
       ? data
       : (Array.isArray(data) && data[0] ? data[0] : j);
+    const gn = typeof info.groupname === "string" && info.groupname
+      ? info.groupname
+      : (typeof info.name === "string" ? info.name : "");
     return {
       isOwner: info.owner === username,
-      groupname: typeof info.groupname === "string" ? info.groupname : "",
+      groupname: gn,
     };
   } catch {
     return { isOwner: false, groupname: "" };
@@ -858,7 +864,9 @@ async function handleLevelRequest(env, path, body) {
       // 的公告群，之前只验“是不是群主”不验群名，发到错群也返回 ok:true，
       // 控制台显示“已发布”但 app 读另一个群所以看不到。群名不对直接 403，
       // 不再静默成功。
-      if (admin.groupname !== "我们的爱情-系统公告") {
+      // v9：只有“明确知道群名且不对”才拦；取不到群名时放行（只认 groupname
+      // 一个字段的 v8 把正确群也 403 了，因为环信有的接口返回的是 name）。
+      if (admin.groupname && admin.groupname !== "我们的爱情-系统公告") {
         return json({ ok: false, error: "公告只能发到系统公告群" }, 403);
       }
       const hash = await levelSha256Hex(title + "\n" + content);
