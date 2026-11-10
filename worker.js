@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v7
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v8
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -41,6 +41,12 @@
 // app 因网络问题重试时，先查缓存——缓存命中且环信那边已查无此人，
 // 就直接返回上次的成功结果，不再重复删；同名新账号仍在则走正常流程。
 // 失败的结果不缓存，重试会重新走流程。app 不用改，重试逻辑本来就有。
+//
+// v8 (2026-11-10) 公告群名校验：/level/send-announcement 在验群主通过后，
+//   再比对群名必须是 "我们的爱情-系统公告"，不对直接 403（之前只验群主
+//   不验群名，发到错群也返回 ok:true，控制台显示已发布但 app 看不到）。
+//   levelVerifyGroupOwner 改为返回 { isOwner, groupname }，send-mail 的
+//   调用点同步改成取 .isOwner；wrangler.toml 不动。
 //
 // v7 (2026-11-10) M-16 彻底修：等级记录改走 Durable Object 单写者。
 //   用户改主意了，DO 也要修（v6 曾按“已知窄窗口”记下，见下）。
@@ -402,20 +408,26 @@ async function levelVerify(env, body) {
 }
 
 // 管理员校验：用 app token 调环信 GET /chatgroups/{group_id}，owner 必须是本人。
+// 返回 { isOwner, groupname }：groupname 供 /level/send-announcement 校验
+// “只能发到系统公告群”（v8）。环信返回的 data 可能是对象也可能是数组，
+// owner 和 groupname 都按两种形状取。
 async function levelVerifyGroupOwner(env, appToken, groupId, username) {
   const r = await fetch(`${BASE(env)}/chatgroups/${encodeURIComponent(groupId)}`, {
     headers: { Authorization: "Bearer " + appToken },
   });
-  if (!r.ok) return false;
+  if (!r.ok) return { isOwner: false, groupname: "" };
   try {
     const j = await r.json();
     const data = j.data;
-    const owner = data && typeof data === "object" && !Array.isArray(data)
-      ? data.owner
-      : (Array.isArray(data) && data[0] ? data[0].owner : j.owner);
-    return owner === username;
+    const info = data && typeof data === "object" && !Array.isArray(data)
+      ? data
+      : (Array.isArray(data) && data[0] ? data[0] : j);
+    return {
+      isOwner: info.owner === username,
+      groupname: typeof info.groupname === "string" ? info.groupname : "",
+    };
   } catch {
-    return false;
+    return { isOwner: false, groupname: "" };
   }
 }
 
@@ -777,8 +789,8 @@ async function handleLevelRequest(env, path, body) {
     }
     try {
       const appToken = await getAppToken(env);
-      const isAdmin = await levelVerifyGroupOwner(env, appToken, groupId, username);
-      if (!isAdmin) return json({ ok: false, error: "只有管理员可以发邮件" }, 403);
+      const admin = await levelVerifyGroupOwner(env, appToken, groupId, username);
+      if (!admin.isOwner) return json({ ok: false, error: "只有管理员可以发邮件" }, 403);
       // v5 M-13：同 key 10 分钟内重试，直接返回原来那封，不再重发。
       if (idemKey) {
         const priorRaw = await env.LEVEL_KV.get("idem-mail:" + idemKey);
@@ -840,8 +852,15 @@ async function handleLevelRequest(env, path, body) {
     }
     try {
       const appToken = await getAppToken(env);
-      const isAdmin = await levelVerifyGroupOwner(env, appToken, groupId, username);
-      if (!isAdmin) return json({ ok: false, error: "只有管理员可以发公告" }, 403);
+      const admin = await levelVerifyGroupOwner(env, appToken, groupId, username);
+      if (!admin.isOwner) return json({ ok: false, error: "只有管理员可以发公告" }, 403);
+      // v8：公告只能发到系统公告群。控制台和 app 各自盯着两个同名不同 id
+      // 的公告群，之前只验“是不是群主”不验群名，发到错群也返回 ok:true，
+      // 控制台显示“已发布”但 app 读另一个群所以看不到。群名不对直接 403，
+      // 不再静默成功。
+      if (admin.groupname !== "我们的爱情-系统公告") {
+        return json({ ok: false, error: "公告只能发到系统公告群" }, 403);
+      }
       const hash = await levelSha256Hex(title + "\n" + content);
       const dupKey = "ann:" + hash;
       const dup = await env.LEVEL_KV.get(dupKey);
