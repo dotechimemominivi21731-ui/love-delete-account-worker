@@ -12,7 +12,9 @@ id = "2d8f6cb816814df89742dd407b8ca074"
 
 # v7 M-16：每用户等级记录的单写者 Durable Object（LevelStore）。
 # 免费套餐必须用 new_sqlite_classes，否则报 10097（照抄邀请码 Worker 的 InviteClaim）。
-[[durable_objects]]
+# 注意：durable_objects 是单个表 [durable_objects]，不是数组 [[durable_objects]]——
+# 写成 [[durable_objects]] 会让 wrangler 报 "should be an object but got [...]"，构建直接失败（v7 2026-11-10 教训）。
+[durable_objects]
 bindings = [{ name = "LEVEL_STORE", class_name = "LevelStore" }]
 
 [[migrations]]
