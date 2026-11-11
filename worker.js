@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v11
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v12
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -135,6 +135,48 @@
 //     (fail closed，失败 403)，通过后跳过密码验证和群主身份验证，直接以
 //     管理员身份发到 pinning 的公告群（from 用群主账号）；60 秒去重、群组
 //     锁定等现有逻辑不变；密钥值不写进代码或日志。
+//
+// v12 (2026-11-12) 审计 v10.8.6-full 的 Worker 12 条全修（W-M3 彻底修、
+//   W-M4 按用户决定修、W-M10 测试账号实测，见下）：
+//   W-M1: 公告去重命中改回 {ok:true, replayed:true}，与 send-mail 一致
+//         （旧版 {ok:false, error:"不要重复发送"}，调用方只能按文案区分成败）。
+//   W-M2: checkin / claim-mail 的 levelCoupleTotal 加 try/catch 兜底
+//         （照抄 add-xp 的写法）：伴侣 DO 读失败时用本人 xp 算总分，
+//         已落盘的签到/领邮件不再被报成 500。
+//   W-M3: /delete-account 的幂等重放移到 verifyOwner 之后（与 /admin-delete
+//         对称），不再凭用户名裸探“该账号刚被删”；并彻底修掉该移动的
+//         副作用（用户 2026-11-12 不接受“合法重试也 403”的取舍）：
+//         删成功时把请求体里实际给出的凭证（token 和/或密码）各存一份
+//         SHA-256 哈希进幂等记录（只存哈希，绝不存明文）；校验失败时先
+//         凭旧凭证哈希比对重放——合法重试（app 存着同一份凭证）能成功，
+//         探测者只凭用户名拿不出凭证、哈希比对失败仍 403；重放前仍先验
+//         “用户已不在环信上”，同名新账号不受旧记录影响。详见
+//         idemReplayWithCred 注释（为什么能同时满足两点）。
+//   W-M4: 换绑经验清零（用户决定 2026-11-12）：DO bind op 里，之前绑定过
+//         别人（rec.bound 非空）且本次绑的是不同的人时，本人 XP 清零、
+//         等级称号随之收回，邮箱授予的特殊称号 stitles/dtitle 不动；
+//         首次绑定与绑回同一人不触发；回包透传 xpReset 给 app。
+//         unbind 本来就清零，“分手后直接换绑”与“先解绑再绑”结果一致。
+//   W-M5: fetchGroupInfo 的 owner 加备用字段名 fallback
+//         （owner → owner_username → group_owner，照抄 groupname 的
+//         groupname→name 两级 fallback 写法）。
+//   W-M6: /stats 也认 j.data 形状（与 findAnnouncementGroup 的群列表解析
+//         同款，entities/data 两种形状都认）。
+//   W-M11: admin_key 与密码同时出现时改回 400，要求只传一种（旧版 admin_key
+//         优先、错 key + 对密码也回 403“管理员密钥不对”，语义不明）。
+//   W-M12: 公告改成 send-mail 的“先记键后发 + 失败补偿”：发送成功后写
+//         idem-ann-rec KV 登记（10 分钟 TTL）+ confirm 幂等键；重试时先查
+//         登记，第一次发送成功但 confirm 丢失时直接重放，不再发第二条。
+//         残留窗口与 send-mail 同款（登记写失败 + confirm 丢 + 10 分钟后重试）。
+//   W-P1: 公告标题/内容长度按码点计数（[...str].length），emoji 只算 1 位。
+//   W-P2: level 限流桶按端点分组拆开：get-couple 单独一桶，checkin/add-xp
+//         另一桶，其余 level 接口仍共用原桶——get-couple 轮询不再挤占签到/加分。
+//   W-P3: GET 任意路径回 405（Method Not Allowed），其余方法保持 404。
+//   W-M10 已实测（2026-11-12，测试账号，绝未用真账号）：删号 token 路径
+//         依赖的假设成立，且比 403 更严——同一 user token GET 本人资料 200，
+//         GET 他人资料 401（EasemobSecurityException / unauthorized，
+//         两组独立账号对均复现）。结论：token 路径安全，不改；二次核对留作
+//         纵深防御。详见 verifyUserTokenOwner 注释。
 //
 // 需要在 Worker 里配置的 Secrets (Dashboard > Settings > Variables):
 //   EASEMOB_ORG           环信控制台里的 org 编号
@@ -333,15 +375,15 @@ function extractUsernameFromProfile(j) {
   return "";
 }
 
-// v11 W-M10 (遗留，未改 token 路径)：下面二次核对成立的前提是——
-//   环信 GET /users/{username} 在 user token 下要么 403、要么只返回 token
-//   本人的资料。Easemob 官方文档未明确写明“user token GET 他人资料是否
-//   403”（只写了 RBAC 模型与 app token/用户 token 的区分），本次未用真账号
-//   密码探测，无法证实。最坏假设：若环信返回的是“被请求用户”的资料（任一
-//   合法 token 可读任意用户资料），extractUsernameFromProfile 取到的就是
-//   要删的用户名本身，name !== username 永不成立，该核对为空校验，任意
-//   登录用户凭自己的 token 可删任意账号。待测试账号实测该接口行为后定级；
-//   若证实为 (b)，应改走只返回 token 归属的校验方式或弃用 token 路径。
+// v12 W-M10（已实测，2026-11-12，测试账号 wmm10test1/2 与 wmm10ctl1/2，
+//   绝未用真账号）：假设成立，且比原假设的 403 更严——
+//   同一 user token GET 本人资料返回 200（entities[0].username = 本人）；
+//   GET 他人资料返回 401 {exception:"EasemobSecurityException",
+//   error:"unauthorized", error_description:"Unable to authenticate (OAuth)"}，
+//   两组独立账号对均复现。结论：任一合法 token 不能读任意用户资料，
+//   token 路径安全，无需改为“只返回 token 归属的校验”或弃用；下面二次
+//   核对（返回体用户名必须等于要删的用户名）继续留作纵深防御。
+//   环信侧行为如将来有变（返回体口径变化），二次核对仍会 fail closed。
 async function verifyUserTokenOwner(env, username, userToken) {
   let r;
   try {
@@ -459,6 +501,52 @@ async function userExists(env, appToken, username) {
 async function idemReplay(env, kind, username) {
   const cached = await idemGet(env, kind, username);
   if (!cached || !cached.ok) return null;
+  try {
+    const appToken = await getAppToken(env);
+    if (!(await userExists(env, appToken, username))) {
+      return { ok: true, deleted: username, replayed: true };
+    }
+  } catch { /* 查存在性失败时走正常流程，不直接报错 */ }
+  return null;
+}
+
+// v12 W-M3（彻底修）：凭旧凭证哈希重放删号成功结果。
+//   为什么这样能同时满足两点：
+//   (a) 合法重试能成功——删号成功后响应丢失，账号已不在环信上，
+//       verifyOwner 必然失败；但重试方手里仍是删号时用的那份凭证
+//       （app 存着同一份 token/密码），其 SHA-256 与删号成功时存入
+//       幂等记录的哈希比对通过，且环信上该用户确实已不存在，就重放
+//       成功结果，不再 403。
+//   (b) 探测仍被挡住——探测者只知道用户名，拿不出被删账号的旧凭证，
+//       哈希比对失败就返回 null（调用方照旧 403），凭用户名裸探与
+//       v12 之前一样拿不到任何信息；且重放前仍先验“用户已不在环信上”，
+//       同名新账号注册后旧凭证既不能删新号、也不能重放旧结果。
+//   凭证只存 SHA-256 哈希（levelSha256Hex，WebCrypto），绝不存明文
+//   token/密码；哈希不可逆推不出凭证原文。删号成功时把请求体里实际
+//   给出的全部凭证（token 和/或密码）各存一份哈希——请求整体当时已
+//   通过 verifyOwner 校验，其中个别没通过的凭证（如 token 对、密码
+//   错时密码的哈希）只有看到过该次请求体的人才拿得到，等价于同一
+//   个合法客户端重试，不构成新口子。
+//   旧版幂等记录（无 credHashes 字段）直接视为不可重放（fail closed）。
+//   注意：哈希比对只证明“出示了删号时用过的凭证”，不证明“现在仍是
+//   该账号主人”——但重放只返回一个已经发生的删除结果，不做新删除，
+//   且用户已不存在，风险等价于“再告诉你一次删成功了”。
+async function idemReplayWithCred(env, kind, username, userToken, password) {
+  const cached = await idemGet(env, kind, username);
+  if (!cached || !cached.ok) return null;
+  const stored = Array.isArray(cached.credHashes) ? cached.credHashes : [];
+  if (!stored.length) return null; // 旧记录无凭证哈希，不可重放
+  const cands = [];
+  if (typeof userToken === "string" && userToken) cands.push(await levelSha256Hex(userToken));
+  if (typeof password === "string" && password) cands.push(await levelSha256Hex(password));
+  let match = false;
+  for (const c of cands) {
+    for (const s of stored) {
+      if (typeof s === "string" && timingSafeEqual(c, s)) { match = true; break; }
+    }
+    if (match) break;
+  }
+  if (!match) return null;
   try {
     const appToken = await getAppToken(env);
     if (!(await userExists(env, appToken, username))) {
@@ -706,9 +794,17 @@ async function fetchGroupInfo(env, appToken, groupId) {
     const gn = typeof info.groupname === "string" && info.groupname
       ? info.groupname
       : (typeof info.name === "string" ? info.name : "");
+    // v12 W-M5: owner 加备用字段名 fallback（照抄上面 groupname 的
+    // groupname→name 两级 fallback 写法）：环信详情某天缺 owner 字段时，
+    // 依次试 owner_username / group_owner，仍取不到才按 "" 处理。
+    const ow = typeof info.owner === "string" && info.owner
+      ? info.owner
+      : (typeof info.owner_username === "string" && info.owner_username
+        ? info.owner_username
+        : (typeof info.group_owner === "string" ? info.group_owner : ""));
     return {
       id: String(groupId),
-      owner: typeof info.owner === "string" ? info.owner : "",
+      owner: ow,
       groupname: gn,
     };
   } catch {
@@ -1231,6 +1327,22 @@ export class LevelStore {
             return json({ ok: false, error: "对方已绑定其他人" }, 400);
           }
         }
+        // v12 W-M4 (用户决定 2026-11-12：换绑经验清零)：
+        //   触发条件只有一种——之前绑定过别人 (rec.bound 非空) 且本次绑的是
+        //   不同的人 (rec.bound !== partner)。首次绑定 (rec.bound 为空) 与
+        //   绑回同一人 (rec.bound === partner) 都不触发。
+        //   清零内容与 unbind 同款：xp/签到/消息计数清零，等级称号随 XP
+        //   清零而收回（等级称号由等级推导）；邮箱授予的特殊称号 stitles
+        //   与 dtitle 不动（dtitle 若不在 stitles 里才清空，照抄 unbind）。
+        //   unbind 本来就清零，所以“分手后直接换绑”与“先解绑再绑”结果一致。
+        if (rec.bound && rec.bound !== body.partner) {
+          rec.xp = 0;
+          rec.ck = "";
+          rec.msgd = "";
+          rec.msgc = 0;
+          if (rec.stitles.indexOf(rec.dtitle) === -1) rec.dtitle = "";
+          result = { xpReset: true, prevPartner: rec.bound };
+        }
         rec.bound = body.partner;
         break;
       }
@@ -1319,10 +1431,14 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     return json({ ok: false, error: "Worker 还没配好等级存储（LEVEL_STORE 未绑定）" }, 500);
   }
   // v10 W-M7: level 密码校验限流（每 IP+用户名 30 次/分钟），挡在线试探。
+  // v12 W-P2: 桶按端点分组拆开——get-couple 单独一桶，checkin/add-xp
+  // 另一桶，其余 level 接口仍共用原桶；get-couple 轮询不再挤占签到/加分额度。
   const lvUser = strField(body, "username") || "";
   if (lvUser) {
+    const lvBucket = path === "/get-couple" ? "lv-get:"
+      : (path === "/checkin" || path === "/add-xp" ? "lv-xp:" : "lv:");
     rateLimitPrune();
-    if (!rateLimitOk("lv:" + clientIp + ":" + lvUser, 30, 60000)) {
+    if (!rateLimitOk(lvBucket + clientIp + ":" + lvUser, 30, 60000)) {
       return json({ ok: false, error: "请求太频繁，请稍后再试" }, 429);
     }
   }
@@ -1339,7 +1455,14 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     // app 侧以服务端返回为准写 EXT，不再用设备日期。
     if (!r.ok) return json({ ok: false, error: r.error, date: d });
     const rec = r.rec;
-    const total = await levelCoupleTotal(env, rec, username);
+    // v12 W-M2: levelCoupleTotal 加 try/catch 兜底（照抄 add-xp :1364-1367
+    // 的写法）：伴侣 DO 读失败时只算本人 xp，不把已落盘的签到报成 500。
+    let total = rec.xp;
+    try {
+      total = await levelCoupleTotal(env, rec, username);
+    } catch {
+      total = rec.xp;
+    }
     const level = levelForXp(total);
     return json({ ok: true, xp: rec.xp, totalXp: total, level: level, title: levelTitleFor(level), checkedInToday: true });
   }
@@ -1410,7 +1533,14 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     // 补充项 S2: DO 回的 code (如 already_claimed) 原样透传给 app。
     if (!r.ok) return json({ ok: false, error: r.error, ...(r.code ? { code: r.code } : {}) });
     const rec = r.rec;
-    const total = await levelCoupleTotal(env, rec, username);
+    // v12 W-M2: 与 checkin 同款兜底——伴侣 DO 读失败时只算本人 xp，
+    // 不把已落盘的领邮件报成 500。
+    let total = rec.xp;
+    try {
+      total = await levelCoupleTotal(env, rec, username);
+    } catch {
+      total = rec.xp;
+    }
     const level = levelForXp(total);
     return json({ ok: true, xp: rec.xp, totalXp: total, level: level, title: levelTitleFor(level), titles: rec.stitles });
   }
@@ -1550,9 +1680,12 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
   }
 
   // ----- POST /level/send-announcement：管理员发公告（验身份 + 60 秒去重） -----
-  // v10 W-B5/W-P4: 去重查+写进 MailGate DO 原子完成，顺序统一为“先发后记键”——
-  // 先发环信消息，成功后再确认去重键；发送失败释放预留，不留去重键，60 秒内可重试
-  // （旧版先 put ann: 占位再发，发送失败后去重键仍在，60 秒内重试报“不要重复发送”）。
+  // v10 W-B5/W-P4: 去重查+写进 MailGate DO 原子完成；发送失败释放预留，
+  // 不留去重键，60 秒内可重试。
+  // v12 W-M12: 顺序改成 send-mail 的“先记键后发 + 失败补偿”——发送成功后
+  // 写 idem-ann-rec KV 登记（10 分钟 TTL）+ confirm 幂等键；重试时先查登记，
+  // 第一次发送成功但 confirm 丢失时直接重放，不再发第二条（旧版“先发后记键”，
+  // 发送成功 + confirm 两次重试都丢 + 60 秒后重试会重发一条公告）。
   // v11 新功能 (用户 2026-11-11 批准): 除 {username, password, group_id, title,
   // content} 外，再接受 {admin_key, title, content}。admin_key 复用
   // verifyAdminKey 校验（fail closed，失败 403）；通过后跳过密码验证和群主
@@ -1567,9 +1700,20 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     const title = strField(body, "title") || "";
     const content = strField(body, "content") || "";
     if (!title || !content) return json({ ok: false, error: "标题和内容不能为空" }, 400);
-    if (title.length > 50) return json({ ok: false, error: "标题最多 50 字" }, 400);
-    if (content.length > 2000) return json({ ok: false, error: "内容最多 2000 字" }, 400);
-    const adminKeyMode = typeof body.admin_key === "string" && body.admin_key.trim() !== "";
+    // v12 W-P1: 长度按码点计数（[...str].length），emoji 只算 1 位，
+    // 不再按 UTF-16 .length 计（emoji 占 2 位会把合法标题误判超限）。
+    if ([...title].length > 50) return json({ ok: false, error: "标题最多 50 字" }, 400);
+    if ([...content].length > 2000) return json({ ok: false, error: "内容最多 2000 字" }, 400);
+    // v12 W-M11: admin_key 与密码同时出现时不再 admin_key 优先——
+    // 直接回 400，要求调用方只传一种认证方式（admin_key 或密码二选一）。
+    // 旧语义：body 含非空 admin_key 即进 admin_key 模式，错 key + 对密码
+    // 也回 403“管理员密钥不对”，调用方分不清是 key 错还是模式错。
+    const hasPassword = typeof body.password === "string" && body.password.trim() !== "";
+    const hasAdminKey = typeof body.admin_key === "string" && body.admin_key.trim() !== "";
+    if (hasAdminKey && hasPassword) {
+      return json({ ok: false, error: "请只传 admin_key 或密码中的一种，不要同时传" }, 400);
+    }
+    const adminKeyMode = hasAdminKey;
     let username = "";
     let clientGroupId = "";
     if (adminKeyMode) {
@@ -1622,16 +1766,34 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
       }
       const hash = await levelSha256Hex(title + "\n" + content);
       // v11 W-M8: 去重键加上群 id——同一标题+内容发到不同群不再误判重复。
-      const gate = await mailGateReserve(env, "ann:" + annGroup.id + ":" + hash, 60000);
-      if (gate.replayed) return json({ ok: false, error: "不要重复发送" });
+      // v12 W-M12: 改成 send-mail 的“先记键后发 + 失败补偿”：
+      //   重试时先查 idem-ann-rec 登记——第一次发送成功但 confirm 丢失时
+      //   直接重放，不再发第二条公告；登记只在发送成功后写（10 分钟 TTL），
+      //   发送失败不写登记，重试正常重发。残留窗口与 send-mail 同款：
+      //   需“发送成功 + 登记写失败 + confirm 丢 + 10 分钟后重试”才可能重发。
+      const annKey = "ann:" + annGroup.id + ":" + hash;
+      try {
+        const prev = await env.LEVEL_KV.get("idem-ann-rec:" + annKey);
+        if (prev) return json({ ok: true, replayed: true });
+      } catch { /* 查不到就按正常流程走 */ }
+      const gate = await mailGateReserve(env, annKey, 60000);
+      // v12 W-M1: 去重命中改回 {ok:true, replayed:true}，与 send-mail 一致
+      // （旧版 {ok:false, error:"不要重复发送"}，调用方只能按文案区分成败）。
+      if (gate.replayed) return json({ ok: true, replayed: true });
       if (!gate.ok) return json({ ok: false, error: gate.error || "正在处理中，请稍后再试" });
       try {
         await levelSendEasemobMessage(env, appToken, "chatgroups", annGroup.id, "[公告]" + title + "\n" + content, fromUser, null);
       } catch (e) {
-        await mailGateRelease(env, "ann:" + annGroup.id + ":" + hash, gate.nonce);
+        await mailGateRelease(env, annKey, gate.nonce);
         throw e;
       }
-      await mailGateConfirm(env, "ann:" + annGroup.id + ":" + hash, gate.nonce, null);
+      // 发送成功后记 idem 登记（重试 3 次，失败只记日志）+ confirm 幂等键。
+      try {
+        await kvRetry(() => env.LEVEL_KV.put("idem-ann-rec:" + annKey, annGroup.id, { expirationTtl: 600 }), 3);
+      } catch (e) {
+        console.error("公告 idem 登记失败", annKey, e);
+      }
+      await mailGateConfirm(env, annKey, gate.nonce, null);
       return json({ ok: true });
     } catch (e) {
       if (e && e.upstream) return json({ ok: false, error: "环信服务暂时不可用，请稍后再试" }, 500);
@@ -1814,7 +1976,8 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
         console.error("换绑清旧伴侣回指失败", oldPartner, e);
       }
     }
-    return json({ ok: true, bound: partner });
+    // v12 W-M4：换绑清零时把 xpReset 透传给 app（DO 里已清 XP，app 侧可据此刷新等级显示）。
+    return json({ ok: true, bound: partner, ...(r.xpReset ? { xpReset: true } : {}) });
   }
 
   // ----- POST /level/unbind：解绑（等级清零，特殊称号保留） -----
@@ -1861,7 +2024,9 @@ export default {
         });
       }
       if (request.method !== "POST") {
-        return withCors(json({ ok: false, error: "只支持 POST" }, 404), request);
+        // v12 W-P3: GET 回 405（Method Not Allowed），其余方法保持 404。
+        const status = request.method === "GET" ? 405 : 404;
+        return withCors(json({ ok: false, error: "只支持 POST" }, status), request);
       }
       const url = new URL(request.url);
 
@@ -1907,7 +2072,11 @@ export default {
               throw new Error("环信查用户失败: HTTP " + r.status);
             }
             const j = await r.json();
-            const list = Array.isArray(j.entities) ? j.entities : [];
+            // v12 W-M6: entities/data 两种形状都认（与 findAnnouncementGroup
+            // 的群列表解析同款）；只认 entities 时，环信回 data 形会静默报 total 0。
+            const list = Array.isArray(j && j.data)
+              ? j.data
+              : (Array.isArray(j && j.entities) ? j.entities : []);
             total += list.length;
             cursor = typeof j.cursor === "string" ? j.cursor : "";
             if (!cursor) break;
@@ -1979,11 +2148,6 @@ export default {
         return withCors(json({ ok: false, error: "请求太频繁，请稍后再试" }, 429), request);
       }
 
-      // M10：上次删成功但 app 没收到结果，重试直接返回成功。
-      // （放在身份校验之前：用户已被删掉时，密码/token 校验本来就会失败。）
-      const replayed = await idemReplay(env, "del", username);
-      if (replayed) return withCors(json(replayed), request);
-
       // 1. 校验本人 (防别人乱删号)
       // v10 W-B4: token 路径二次核对归属 + token 失败回退密码校验（见 verifyOwner）。
       let ok = false;
@@ -1993,7 +2157,21 @@ export default {
         console.error("校验身份时出错", e);
         return withCors(json({ ok: false, error: "身份校验服务暂时不可用，请稍后再试" }, 500), request);
       }
-      if (!ok) return withCors(json({ ok: false, error: "身份校验失败, 只能注销自己的账号" }, 403), request);
+      if (!ok) {
+        // v12 W-M3（彻底修）：删成功后响应丢失的合法重试——此时账号已不在
+        //   环信上，verifyOwner 必然失败；改凭“删号时存入幂等记录的旧凭证
+        //   SHA-256 哈希”比对重放（见 idemReplayWithCred 注释：为什么这样
+        //   能同时满足“合法重试成功 + 探测被挡”）。比对失败/无凭证时仍
+        //   403，探测者只凭用户名什么都拿不到。
+        const replayed = await idemReplayWithCred(env, "del", username, body.userToken, body.password);
+        if (replayed) return withCors(json(replayed), request);
+        return withCors(json({ ok: false, error: "身份校验失败, 只能注销自己的账号" }, 403), request);
+      }
+
+      // M10：上次删成功但 app 没收到结果，重试直接返回成功（账号仍在
+      //   时返回 null，走下面正常删号；删号前已缓存的情形才可达）。
+      const replayed = await idemReplay(env, "del", username);
+      if (replayed) return withCors(json(replayed), request);
 
       // 2. 应用 token + 删服务器上的账号
       try {
@@ -2008,7 +2186,15 @@ export default {
           if (r.status >= 500) throw new UpstreamError("环信服务暂时不可用");
           return withCors(json({ ok: false, error: "环信删号失败，请稍后再试" }, 502), request);
         }
-        await idemPut(env, "del", username, { ok: true, deleted: username });
+        // v12 W-M3：删成功后把请求体里实际给出的凭证各存一份 SHA-256
+        // 哈希（token 和/或密码，只存哈希，绝不存明文），供“删成功后
+        // 响应丢失、合法重试”时比对重放（见 idemReplayWithCred）。
+        // KV 10 分钟过期，到期后重试走正常删号（账号已不在会报 502，
+        // 与旧行为一致）。
+        const credHashes = [];
+        if (typeof body.userToken === "string" && body.userToken) credHashes.push(await levelSha256Hex(body.userToken));
+        if (typeof body.password === "string" && body.password) credHashes.push(await levelSha256Hex(body.password));
+        await idemPut(env, "del", username, { ok: true, deleted: username, credHashes });
         return withCors(json({ ok: true, deleted: username }), request);
       } catch (e) {
         console.error("删号时出错", e);
