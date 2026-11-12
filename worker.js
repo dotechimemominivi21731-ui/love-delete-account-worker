@@ -2254,7 +2254,8 @@ export default {
       if (levelPath === "/checkin" || levelPath === "/add-xp" || levelPath === "/claim-mail"
         || levelPath === "/send-mail" || levelPath === "/send-announcement"
         || levelPath === "/get-couple" || levelPath === "/get-other" || levelPath === "/migrate" || levelPath === "/unbind"
-        || levelPath === "/bind" || levelPath === "/check-deleted") {
+        || levelPath === "/bind" || levelPath === "/check-deleted"
+        || levelPath === "/record-recall" || levelPath === "/get-recalls") {
         const levelBody = await parseJsonBody(request);
         if (!levelBody) return withCors(json({ ok: false, error: "请求体不是 JSON 或不是对象" }, 400), request);
         return withCors(await handleLevelRequest(env, levelPath, levelBody, ip), request);
