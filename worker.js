@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v12
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v13
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -15,6 +15,7 @@
 //     /level/migrate          首次把手机 EXT 里的等级快照迁到服务器 (v10: 服务端封顶+白名单+验 bound, 不再信任快照)
 //     /level/bind             绑定 (v10: 验对方存在、不覆盖已有绑定、换绑先清旧伴侣回指)
 //     /level/unbind           解绑 (等级清零, 特殊称号保留; 未绑定时直接报 ok:false, 不动经验)
+//     /level/check-deleted    批量查环信账号是否已被注销 (供大厅“已注销用户”标记用, v13 新增)
 //   level 接口一律 POST JSON { username, password, ... }，密码用环信登录校验；
 //   路径可带 /level 前缀也可不带（代理会去掉前缀再转发，两种都认）。
 // Client Secret 只存在 Worker 的 Secrets 里, 绝不放进 app。
@@ -177,6 +178,24 @@
 //         GET 他人资料 401（EasemobSecurityException / unauthorized，
 //         两组独立账号对均复现）。结论：token 路径安全，不改；二次核对留作
 //         纵深防御。详见 verifyUserTokenOwner 注释。
+//
+// v13 (2026-11-12) 新功能：POST /level/check-deleted（批量查账号是否已注销，
+//   供大厅“已注销用户”标记用）：
+//   为什么必须走服务端：消息本身分不清发送者是被删号还是被移出大厅
+//   （两种情况在成员列表里都“不在”），LEVEL_KV 里的等级记录在删号后
+//   仍保留，/level/get-other 也分不出来；唯一可信的判据是服务端用
+//   app token 问环信 GET /users/{用户名}。
+//   调用方须先过 levelVerify（username+password，与其余 level 接口
+//   同款），匿名请求直接 403——存在性查询不能做成匿名口子（防用户名
+//   枚举）；限流走 handleLevelRequestInner 开头的通用桶（lv: 每 IP+
+//   用户名 30 次/分钟，与其余 level 接口同款）。
+//   请求体 { username, password, usernames: [...] }，usernames 最多
+//   50 个，超限 400；非字符串/空串/重复项跳过（不整批失败）。
+//   逐个用 app token 查：200 = 还在（不返回），404 = 已注销（进
+//   deleted），其余状态/网络失败进 unknown——绝不在不确定时判已注销
+//   （fail closed：401/403/5xx 都只算 unknown）。返回
+//   { ok:true, deleted:[...], unknown:[...] }。
+//   删号成功后同名新账号再注册时 GET 返回 200，旧删除记录不影响判定。
 //
 // 需要在 Worker 里配置的 Secrets (Dashboard > Settings > Variables):
 //   EASEMOB_ORG           环信控制台里的 org 编号
@@ -1853,6 +1872,60 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     return json({ ok: true, bound: true, level: level, title: levelTitleFor(level), totalXp: total });
   }
 
+  // ----- POST /level/check-deleted：批量查环信账号是否已被注销 -----
+  // v13 新增（大厅“已注销用户”标记用）：消息本身分不清发送者是被删号
+  // 还是被移出大厅（两种情况在成员列表里都“不在”），LEVEL_KV 里的等级
+  // 记录在删号后仍保留，/level/get-other 也分不出来；唯一可信的判据
+  // 是服务端用 app token 问环信 GET /users/{用户名}。
+  // 匿名请求直接 403（存在性查询不能做成匿名口子）；限流走开头的通用
+  // 桶（lv: 每 IP+用户名 30 次/分钟，与其余 level 接口同款）。
+  // 只认 404 为已注销；200 为还在；其余状态/网络失败一律 unknown，
+  // 绝不在不确定时给人打“已注销”标记（fail closed）。
+  if (path === "/check-deleted") {
+    const username = await levelVerify(env, body);
+    if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
+    if (!requireEasemobSecrets(env)) {
+      return json({ ok: false, error: "Worker 还没配好密钥" }, 500);
+    }
+    const list = body.usernames;
+    if (!Array.isArray(list)) return json({ ok: false, error: "缺少 usernames" }, 400);
+    if (list.length > 50) return json({ ok: false, error: "一次最多查 50 个用户名" }, 400);
+    const targets = [];
+    const seen = new Set();
+    for (const u of list) {
+      if (typeof u !== "string") continue;
+      const name = u.trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      targets.push(name);
+    }
+    const appToken = await getAppToken(env);
+    const deleted = [];
+    const unknown = [];
+    for (const name of targets) {
+      let r;
+      try {
+        r = await fetch(`${BASE(env)}/users/${encodeURIComponent(name)}`, {
+          headers: { Authorization: "Bearer " + appToken },
+        });
+      } catch (e) {
+        console.error("查用户是否注销失败: 网络异常", name, e);
+        unknown.push(name);
+        continue;
+      }
+      if (r.status === 200) {
+        // 还在：不进 deleted 也不进 unknown。
+      } else if (r.status === 404) {
+        deleted.push(name);
+      } else {
+        // 401/403/5xx 等：不确定，绝不判已注销。
+        console.error("查用户是否注销失败: HTTP " + r.status, name);
+        unknown.push(name);
+      }
+    }
+    return json({ ok: true, deleted: deleted, unknown: unknown });
+  }
+
   // ----- POST /level/migrate：首次把手机 EXT 里的等级快照迁到服务器 -----
   // v10 W-B1: 服务端不再无条件信任客户端快照——
   //   经验上限 = 12 × (服务器今天 − 2025-10-17 的天数) + 已登记的邮件经验总和
@@ -2037,7 +2110,7 @@ export default {
       if (levelPath === "/checkin" || levelPath === "/add-xp" || levelPath === "/claim-mail"
         || levelPath === "/send-mail" || levelPath === "/send-announcement"
         || levelPath === "/get-couple" || levelPath === "/get-other" || levelPath === "/migrate" || levelPath === "/unbind"
-        || levelPath === "/bind") {
+        || levelPath === "/bind" || levelPath === "/check-deleted") {
         const levelBody = await parseJsonBody(request);
         if (!levelBody) return withCors(json({ ok: false, error: "请求体不是 JSON 或不是对象" }, 400), request);
         return withCors(await handleLevelRequest(env, levelPath, levelBody, ip), request);
