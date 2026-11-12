@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v14
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v15
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -18,6 +18,7 @@
 //     /level/check-deleted    批量查环信账号是否已被注销 (供大厅“已注销用户”标记用, v13 新增)
 //     /level/record-recall    1:1 撤回成功后登记一条 (供对方下次进聊天页补删, v14 新增)
 //     /level/get-recalls      1:1 聊天页查对方撤回过我哪些消息 (v14 新增)
+//     /level/send-mail        管理员可以把邮件发给自己 (v15: 去掉了“不能把邮件发给自己”的限制, 用户决定)
 //   level 接口一律 POST JSON { username, password, ... }，密码用环信登录校验；
 //   路径可带 /level 前缀也可不带（代理会去掉前缀再转发，两种都认）。
 // Client Secret 只存在 Worker 的 Secrets 里, 绝不放进 app。
@@ -1688,7 +1689,9 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
       if (scope === "all") return json({ ok: false, error: "称号只能单独发给一个人" }, 400);
     }
     if (scope === "one" && !to) return json({ ok: false, error: "请输入对方的用户名" }, 400);
-    if (scope === "one" && to === username) return json({ ok: false, error: "不能把邮件发给自己" }, 400);
+    // v15 (2026-11-12, 用户决定): 管理员可以把邮件发给自己——自发自领。
+    // 只有服务端 pin 的公告群群主才能调 send-mail (W-B2)，所以放开自发
+    // 不会让别人伪造经验；管理员自发 10000 XP 会直接满级，是用户自己选的。
     // v10 W-M6: note 限长 200 字。
     if (note.length > NOTE_MAX_LEN) return json({ ok: false, error: "备注最多 200 字" }, 400);
     if (!requireEasemobSecrets(env)) {
