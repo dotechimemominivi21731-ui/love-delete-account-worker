@@ -15,10 +15,12 @@ id = "2d8f6cb816814df89742dd407b8ca074"
 # 注意：durable_objects 是单个表 [durable_objects]，不是数组 [[durable_objects]]——
 # 写成 [[durable_objects]] 会让 wrangler 报 "should be an object but got [...]"，构建直接失败（v7 2026-11-10 教训）。
 # v10 W-B5：MailGate（全局单实例）做发邮件幂等 + 公告去重的单写者。
+# v16 W-M5：RateLimiter（全局单实例）做持久化限流桶，isolate 重启不再清零。
 [durable_objects]
 bindings = [
   { name = "LEVEL_STORE", class_name = "LevelStore" },
   { name = "MAIL_GATE", class_name = "MailGate" },
+  { name = "RATE_LIMIT", class_name = "RateLimiter" },
 ]
 
 [[migrations]]
@@ -28,3 +30,7 @@ new_sqlite_classes = ["LevelStore"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["MailGate"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RateLimiter"]

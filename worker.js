@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v15
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v16
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -19,6 +19,38 @@
 //     /level/record-recall    1:1 撤回成功后登记一条 (供对方下次进聊天页补删, v14 新增)
 //     /level/get-recalls      1:1 聊天页查对方撤回过我哪些消息 (v14 新增)
 //     /level/send-mail        管理员可以把邮件发给自己 (v15: 去掉了“不能把邮件发给自己”的限制, 用户决定)
+// v16 (2026-11-12) 审计 v10.8.6-full 第三轮的 Worker 4 条全修（只改这 4 条）：
+//   W-M10: MailGate /confirm、/release 在 nonce 不匹配时不再静默回 ok:true——
+//     键不存在回 404 (code:"key_missing")，nonce 对不上回 409
+//     (code:"nonce_mismatch")；调用方 mailGateConfirm/mailGateRelease 只记日志，
+//     邮件/公告此刻已发出，confirm 丢了绝不能导致重发或向管理员报失败
+//     （send-mail 与 send-announcement 返回的 mail_id / ok:true 不变）。
+//   W-M5: 限流桶持久化——新增 RateLimiter Durable Object（全局单实例，
+//     存储在 DO 的 SQLite 里），isolate 重启/扩容不再清零；DO 未绑定或
+//     调用失败时退回进程内 Map（旧行为），不把限流失败变成 500。
+//     wrangler.toml 加 RATE_LIMIT 绑定 + migration v3（new_sqlite_classes）。
+//     InstaBox 共享桶残留未消除：代理只透传 Content-Type/Content-Length，
+//     不传任何可信的客户端标识（server-live.js 的 I-M2 注释，有意不修）；
+//     Worker 若改信 X-Forwarded-For，直接调 workers.dev 的调用方可以任意
+//     伪造该头、每请求换一个 IP 绕过限流，比共享桶更糟，所以不改。
+//     受影响的是 IP 桶：/stats、/admin-delete、公告 admin_key 模式
+//     （10/min）；level/删号按 IP+用户名分桶，不受影响。
+//   W-B2 钉死群自动恢复：findAnnouncementGroup 拿钉死的 id 调群详情返回 404
+//     时（群已被删），清除 LEVEL_KV 里的 announce-group-pin，再按名重新
+//     查找并钉死（0 个/多个同名群仍拒绝认领，与首次查找同款严格）；群只是
+//     改名（GET 仍 200、群名对不上）时不自动恢复——改名群与冒名群只看名字
+//     分不出来，自动恢复会削弱 pin，仍需 Dashboard 手动删 pin 键（残留）。
+//     404 之外的失败（403/5xx/网络异常）也不清 pin，fail closed。
+//   W-M12: 公告去重登记 (idem-ann-rec) 改成发送的前提——先写登记
+//     （kvRetry 3 次），写失败释放占位并 500，什么都不发；写成功后再发，
+//     发送成功后 confirm 幂等键；重试凭发送前已写好的登记重放，不再发
+//     第二条。残留窗口改成另一头：发送失败 + 删登记补偿 3 次都失败（或
+//     写登记后、发送前进程崩了），10 分钟内重试会误报 {ok:true,
+//     replayed:true} 而实际没发——需“环信发送失败 + KV 删失败”双败，
+//     比旧窗口（发送成功 + 登记写失败 + confirm 丢）更窄，且结果是
+//     “公告没发但报已发送”（管理员看得到公告栏里没有，可改标题重发），
+//     不再是用户可见的重复公告。
+//
 //   level 接口一律 POST JSON { username, password, ... }，密码用环信登录校验；
 //   路径可带 /level 前缀也可不带（代理会去掉前缀再转发，两种都认）。
 // Client Secret 只存在 Worker 的 Secrets 里, 绝不放进 app。
@@ -239,9 +271,10 @@
 // 再加一个 KV Namespace Binding（v4 等级数据用）：
 //   变量名 LEVEL_KV，命名空间 love-level (id 2d8f6cb816814df89742dd407b8ca074)。
 //   没绑 LEVEL_KV 时 /level/* 一律报 500，删号/统计/管理员删号不受影响。
-// 再加两个 Durable Object 绑定（见 wrangler.toml）：
+// 再加三个 Durable Object 绑定（见 wrangler.toml）：
 //   LEVEL_STORE (LevelStore, 每用户单写者, v7)；MAIL_GATE (MailGate, 全局单实例,
-//   发邮件幂等 + 公告去重, v10)。
+//   发邮件幂等 + 公告去重, v10)；RATE_LIMIT (RateLimiter, 全局单实例,
+//   持久化限流桶, v16)。
 //
 // 接口: POST /delete-account (幂等：删成功后 10 分钟内重试直接返回成功)
 //   Body JSON: { "username": "zhaorui", "userToken": "<登录后拿到的用户 token>" }
@@ -281,19 +314,21 @@ function json(data, status = 200) {
   });
 }
 
-// ---------- v10 W-M7: 基础限流 (进程内计数, 简易实现, 够挡在线试探) ----------
-// key → { count, resetAt }；窗口内超限返回 false。Worker 隔离重启后计数清零，
-// 属尽力而为的限流，不做跨实例强一致。
-// v11 W-M5 残留（改不掉，写清）：(a) 计数存在各 isolate 的内存里，isolate
-// 重启/扩容即清零，多 isolate 下限流是 N 倍放宽；(b) 经 InstaBox 代理访问
-// 时，Cloudflare 看到的 CF-Connecting-IP 是 InstaBox 单一出口 IP，/stats
-// 10/min 由全部代理用户共享——一个人打满就让其他人连带 429。代理侧无法
-// 改：server.js 的 proxyToWorker 只透传 Content-Type/Content-Length，
-// 不传 X-Forwarded-For 或任何客户端标识；Worker 侧若改信 X-Forwarded-For，
-// 直接调 workers.dev 的调用方可以任意伪造该头、每请求换一个 IP 绕过限流，
-// 比共享桶更糟，所以不改。level/删号按 IP+用户名分桶，不受此影响；
-// /stats 只有管理员一人调，影响极小；/check 30/min 共享是剩余敞口，
-// 接受（按码分桶会削弱防猜，不做）。
+// ---------- v10 W-M7: 基础限流 ----------
+// v16 W-M5: 限流桶持久化到 RateLimiter Durable Object（DO 的 SQLite 存储，
+//   见 rateLimitOkDurable），isolate 重启/扩容不再清零；DO 未绑定或调用
+//   失败时退回下面这个进程内 Map（旧行为），不把限流失败变成 500。
+//   桶 key → { count, resetAt }；窗口内超限返回 false。
+//   残留（改不掉，写清）：经 InstaBox 代理访问时，Cloudflare 看到的
+//   CF-Connecting-IP 是 InstaBox 单一出口 IP，/stats、/admin-delete 与
+//   公告 admin_key 模式的 10/min 桶由全部代理用户共享——一个人打满就让
+//   其他人连带 429。代理侧无法改：server.js 的 proxyToWorker 只透传
+//   Content-Type/Content-Length，不传 X-Forwarded-For 或任何客户端标识
+//   （server-live.js 的 I-M2 注释，有意不修，因为 InstaBox 边缘本身不提
+//   供可信的客户端 IP）；Worker 侧若改信 X-Forwarded-For，直接调
+//   workers.dev 的调用方可以任意伪造该头、每请求换一个 IP 绕过限流，
+//   比共享桶更糟，所以不改。level/删号按 IP+用户名分桶，不受此影响；
+//   /stats 只有管理员一人调，影响极小；按码分桶会削弱防猜，不做。
 const RATE_BUCKETS = new Map();
 function rateLimitOk(key, limit, windowMs) {
   const now = Date.now();
@@ -313,6 +348,29 @@ function rateLimitPrune() {
   for (const [k, b] of RATE_BUCKETS) {
     if (now >= b.resetAt) RATE_BUCKETS.delete(k);
   }
+}
+
+// v16 W-M5: 限流优先走 RateLimiter DO（持久化）；DO 未绑定（wrangler.toml
+// 还没应用 / 迁移未生效）或调用失败时退回进程内 Map，不把限流失败变成 500。
+async function rateLimitOkDurable(env, key, limit, windowMs) {
+  if (env.RATE_LIMIT) {
+    try {
+      const stub = env.RATE_LIMIT.get(env.RATE_LIMIT.idFromName("rate-limit"));
+      const res = await stub.fetch("https://do/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, limit, windowMs }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        return !!j.ok;
+      }
+      console.error("限流 DO 返回非 2xx，退回进程内限流", res.status);
+    } catch (e) {
+      console.error("限流 DO 调用失败，退回进程内限流", e);
+    }
+  }
+  return rateLimitOk(key, limit, windowMs);
 }
 
 function clientIp(request) {
@@ -795,8 +853,9 @@ async function levelVerify(env, body) {
 
 // v11 W-B2: 公告群 id 钉死 (group pinning) 的 KV 键。钉死的 id 存在 LEVEL_KV
 // 里；首次运行时按名查找并写入 KV；之后每次优先用钉死的 id 校验。
-// 群重建时处理：管理员在 Easemob 控制台建好新群后，删掉 LEVEL_KV 里的
-// 这个键，下一次请求会按名重新查找并钉死新 id（首次查找若发现多个同名群
+// 群重建时处理（v16 W-B2）：群被删时下一次请求自动清 pin 并按名重钉，
+// 不再需要 Dashboard 操作；群只是改名时仍需管理员手动删掉 LEVEL_KV 里
+// 的这个键，下一次请求会按名重新查找并钉死新 id（首次查找若发现多个同名群
 // 则拒绝认领，需先在控制台删掉多余的同名群）。
 const ANNOUNCE_GROUP_PIN_KV_KEY = "announce-group-pin";
 
@@ -819,10 +878,33 @@ async function setPinnedAnnounceGroupId(env, id) {
   }
 }
 
+// v16 W-B2: 清掉钉死的公告群 id（只在“钉死的群已被删、GET 回 404”时调用，
+// 见 findAnnouncementGroup；删失败只记日志——下次请求仍会 404 再清一次，
+// 且按名重钉时会直接覆盖旧 pin）。
+async function clearPinnedAnnounceGroupId(env) {
+  if (!env.LEVEL_KV) return;
+  try {
+    await env.LEVEL_KV.delete(ANNOUNCE_GROUP_PIN_KV_KEY);
+  } catch (e) {
+    console.error("公告群 pin 清除失败", e);
+  }
+}
+
 // 用 app token 调环信 GET /chatgroups/{group_id} 取群信息。
 // 返回 { id, owner, groupname }；群不存在/无权限返回 null；
 // 上游 5xx/网络异常抛 UpstreamError。
+// v16 W-B2: 底下改走 fetchGroupInfoRaw——findAnnouncementGroup 需要
+// 区分“群已删 (404)”与“其他原因查不到”，只有 404 才能触发 pin 自动恢复。
 async function fetchGroupInfo(env, appToken, groupId) {
+  const raw = await fetchGroupInfoRaw(env, appToken, groupId);
+  return raw.info;
+}
+
+// v16 W-B2 自动恢复：取群详情时同时带回 HTTP 状态——群已删时环信回 404，
+// 只有 404 才证明钉死的群确实没了（403/5xx/网络异常都不能证明，不能清 pin）。
+// 返回 { status, info }：网络异常/5xx 抛 UpstreamError（与旧版一致）；
+// 404/其他 4xx 时 info 为 null；200 但解析失败时 info 也为 null。
+async function fetchGroupInfoRaw(env, appToken, groupId) {
   let r;
   try {
     r = await fetch(`${BASE(env)}/chatgroups/${encodeURIComponent(groupId)}`, {
@@ -834,7 +916,7 @@ async function fetchGroupInfo(env, appToken, groupId) {
   }
   if (!r.ok) {
     if (r.status >= 500) throw new UpstreamError("环信服务暂时不可用");
-    return null;
+    return { status: r.status, info: null };
   }
   try {
     const j = await r.json();
@@ -854,12 +936,15 @@ async function fetchGroupInfo(env, appToken, groupId) {
         ? info.owner_username
         : (typeof info.group_owner === "string" ? info.group_owner : ""));
     return {
-      id: String(groupId),
-      owner: ow,
-      groupname: gn,
+      status: r.status,
+      info: {
+        id: String(groupId),
+        owner: ow,
+        groupname: gn,
+      },
     };
   } catch {
-    return null;
+    return { status: r.status, info: null };
   }
 }
 
@@ -891,17 +976,32 @@ async function levelVerifyGroupOwner(env, appToken, groupId, username) {
 //      查不到/群名对不上直接返回 null，不回落到按名查找；
 //   ② KV 里没有时按名翻页找，找到唯一一个才钉死并返回；翻页找完发现
 //      多个同名群时拒绝认领（返回 null，日志记数），不取第一个。
+// v16 W-B2: ① 的例外——钉死的 id 调群详情回 404 时（群已被删），清掉
+//   pin 再走 ② 按名重新查找；群只是改名（群名对不上）时仍不恢复，
+//   返回 null（见文件头 v16 说明）；404 之外的失败也不清 pin。
 async function findAnnouncementGroup(env, appToken) {
   const pinnedId = await getPinnedAnnounceGroupId(env);
   if (pinnedId) {
-    const info = await fetchGroupInfo(env, appToken, pinnedId);
-    // v9 同款原则：群名明确不对才拒绝；取不到群名（""）时放行——钉死的 id
-    // 本身就是身份，群名只是二次核对，不因字段缺失把正确群拦掉。
-    if (!info || (info.groupname && info.groupname !== ANNOUNCE_GROUP_NAME)) {
-      console.error("钉死的公告群 id 查不到或群名不对，拒绝认领", pinnedId, info ? info.groupname : null);
-      return null;
+    const raw = await fetchGroupInfoRaw(env, appToken, pinnedId);
+    const info = raw.info;
+    // v16 W-B2: 只有 404 才证明钉死的群确实被删了——清掉 pin，往下
+    // 按名重新查找并钉死（0 个/多个同名群仍拒绝认领，与首次查找同款
+    // 严格）。群只是改名时 GET 仍回 200、群名对不上，不自动恢复——
+    // 改名群与冒名群只看名字分不出来，自动恢复会削弱 W-B2 的 pin，
+    // 仍需 Dashboard 手动删 pin 键。403/5xx/网络异常不是“群没了”
+    // 的证据，不清 pin，fail closed。
+    if (raw.status === 404) {
+      console.error("钉死的公告群已被删除 (404)，清除 pin 并按名重新查找", pinnedId);
+      await clearPinnedAnnounceGroupId(env);
+    } else {
+      // v9 同款原则：群名明确不对才拒绝；取不到群名（""）时放行——钉死的 id
+      // 本身就是身份，群名只是二次核对，不因字段缺失把正确群拦掉。
+      if (!info || (info.groupname && info.groupname !== ANNOUNCE_GROUP_NAME)) {
+        console.error("钉死的公告群 id 查不到或群名不对，拒绝认领", pinnedId, info ? info.groupname : null);
+        return null;
+      }
+      return info;
     }
-    return info;
   }
   const matches = [];
   let cursor = "";
@@ -1069,8 +1169,11 @@ function levelMergeMigrateRecords(server, snap, allowedTitles) {
 //     已确认且在有效期内返回 { ok:true, replayed:true, value }（幂等重放），
 //     还在 pending（另一路正在发）返回 { ok:false, pending:true }。
 //   POST /confirm { key, nonce, value } —— 发成功后把 pending 置为 done，记下 value。
+//     v16 W-M10: 键不存在回 404 (key_missing)，nonce 对不上回 409
+//     (nonce_mismatch)，不再静默 ok:true；调用方只记日志，绝不因此重发或报错。
 //   POST /release { key, nonce } —— 发送失败时删掉 pending，不留去重键，
 //     60 秒内可重试（公告）/ 立即重试（邮件幂等）。
+//     v16 W-M10: nonce 对不上回 409，不动存储；键不存在按 ok:true（已清理完）。
 // pending 占位最多挡 60 秒（占位方崩了也不至于一直锁死）；done 的有效期由 ttlMs 定
 // （邮件幂等 10 分钟，公告去重 60 秒）。
 export class MailGate {
@@ -1112,28 +1215,106 @@ export class MailGate {
       const key = typeof body.key === "string" ? body.key : "";
       const nonce = typeof body.nonce === "string" ? body.nonce : "";
       if (!key || !nonce) return json({ ok: false, error: "缺少 key 或 nonce" }, 400);
+      // v16 W-M10: nonce 对不上 / 键不存在时不再静默回 ok:true——旧版
+      // 不写存储也回 ok，调用方无法得知 confirm 丢了，键挂 pending 至
+      // 60 秒过期。键不存在回 404 (code:"key_missing")，nonce 对不上回
+      // 409 (code:"nonce_mismatch")；只有 nonce 匹配才置 done。
+      let existing = null;
       try {
-        const existing = await this.state.storage.get(key);
-        if (existing && existing.nonce === nonce) {
-          await this.state.storage.put(key, {
-            nonce, state: "done", value: body.value ?? null,
-            at: Date.now(), ttlMs: existing.ttlMs || 600000,
-          });
-        }
-      } catch { /* 确认写失败不炸掉本次成功，只记日志（调用方已记） */ }
+        existing = await this.state.storage.get(key);
+      } catch (e) {
+        return json({ ok: false, error: "幂等存储读失败" }, 500);
+      }
+      if (!existing) return json({ ok: false, error: "幂等键不存在", code: "key_missing" }, 404);
+      if (existing.nonce !== nonce) return json({ ok: false, error: "nonce 不匹配", code: "nonce_mismatch" }, 409);
+      try {
+        await this.state.storage.put(key, {
+          nonce, state: "done", value: body.value ?? null,
+          at: Date.now(), ttlMs: existing.ttlMs || 600000,
+        });
+      } catch (e) {
+        return json({ ok: false, error: "幂等存储写失败" }, 500);
+      }
       return json({ ok: true });
     }
     if (request.method === "POST" && url.pathname === "/release") {
       const key = typeof body.key === "string" ? body.key : "";
       const nonce = typeof body.nonce === "string" ? body.nonce : "";
       if (!key || !nonce) return json({ ok: false, error: "缺少 key 或 nonce" }, 400);
+      // v16 W-M10: 与 /confirm 同款——nonce 对不上回 409，不动存储；
+      // 键不存在时按 ok:true（释放本就是清理，键没了等于已清理完）。
+      let existing = null;
       try {
-        const existing = await this.state.storage.get(key);
-        if (existing && existing.nonce === nonce) {
+        existing = await this.state.storage.get(key);
+      } catch (e) {
+        return json({ ok: false, error: "幂等存储读失败" }, 500);
+      }
+      if (existing && existing.nonce !== nonce) {
+        return json({ ok: false, error: "nonce 不匹配", code: "nonce_mismatch" }, 409);
+      }
+      if (existing) {
+        try {
           await this.state.storage.delete(key);
+        } catch (e) {
+          return json({ ok: false, error: "幂等存储删失败" }, 500);
         }
-      } catch { /* ignore */ }
+      }
       return json({ ok: true });
+    }
+    return json({ ok: false, error: "not found" }, 404);
+  }
+}
+
+// v16 W-M5: 持久化限流桶（Durable Object，全局单实例）。
+//   为什么不用 KV：KV 读-改-写是最后写赢、最终一致，并发两路同 key
+//   可同时读到 count 9、同时写 10、同时放行；DO 是单线程串行 +
+//   SQLite 存储，计数精确、isolate 重启也不丢。每次 /check 只做
+//   一次 storage.get + 至多一次 storage.put，并发量极小（管理员工具
+//   + level 接口），单实例串行不是瓶颈。
+//   POST /check { key, limit, windowMs } —— 桶不存在/已过期则从 1
+//     开始记，返回 { ok:true, count }；窗口内未超限 count+1 返回
+//     { ok:true, count }；超限返回 { ok:false, count }（不改存储）。
+//   过期行不主动删：key 只有 IP / IP+用户名两种形状，用户数 ≤100，
+//   行数天然有界；过期 key 再来时直接覆盖重记。
+export class RateLimiter {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/check") {
+      let body = {};
+      try { body = await request.json(); } catch { /* ignore */ }
+      const key = typeof body.key === "string" ? body.key : "";
+      const limit = typeof body.limit === "number" && Number.isFinite(body.limit) && body.limit > 0
+        ? Math.floor(body.limit) : 0;
+      const windowMs = typeof body.windowMs === "number" && Number.isFinite(body.windowMs) && body.windowMs > 0
+        ? Math.floor(body.windowMs) : 60000;
+      if (!key || !limit) return json({ ok: false, error: "缺少 key 或 limit" }, 400);
+      const now = Date.now();
+      let row = null;
+      try {
+        row = await this.state.storage.get(key);
+      } catch (e) {
+        return json({ ok: false, error: "限流存储读失败" }, 500);
+      }
+      if (!row || now >= (row.resetAt || 0)) {
+        try {
+          await this.state.storage.put(key, { count: 1, resetAt: now + windowMs });
+        } catch (e) {
+          return json({ ok: false, error: "限流存储写失败" }, 500);
+        }
+        return json({ ok: true, count: 1 });
+      }
+      if (row.count >= limit) return json({ ok: false, count: row.count });
+      try {
+        await this.state.storage.put(key, { count: row.count + 1, resetAt: row.resetAt });
+      } catch (e) {
+        return json({ ok: false, error: "限流存储写失败" }, 500);
+      }
+      return json({ ok: true, count: row.count + 1 });
     }
     return json({ ok: false, error: "not found" }, 404);
   }
@@ -1155,7 +1336,16 @@ async function mailGateCall(env, path, body) {
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     console.error("邮件幂等存储调用失败: HTTP " + res.status + " " + t.slice(0, 200));
-    throw new Error("邮件幂等存储调用失败");
+    // v16 W-M10: 把 DO 的业务错误码挂到抛出的错上，调用方
+    // (mailGateConfirm/mailGateRelease) 可区分 nonce 不匹配/键不存在
+    // 与普通的存储失败。
+    const err = new Error("邮件幂等存储调用失败");
+    err.status = res.status;
+    try {
+      const j = JSON.parse(t);
+      if (j && typeof j.code === "string") err.code = j.code;
+    } catch { /* 非 JSON 错误体就没 code */ }
+    throw err;
   }
   return await res.json();
 }
@@ -1168,24 +1358,36 @@ async function mailGateReserve(env, key, ttlMs) {
 }
 
 async function mailGateConfirm(env, key, nonce, value) {
-  // v11 W-M7: confirm 丢了会导致同一幂等键重试时发第二封，所以失败重试一次；
-  // 两次都失败只记日志（调用方不因此报错——邮件本身已登记/已发出，
-  // 领邮件走 KV 登记，不依赖 confirm；剩余窗口见 send-mail 注释）。
+  // v16 W-M10: DO 在 nonce 不匹配/键不存在时回错（409/404），不再静默
+  // ok:true。邮件/公告此刻已发出，confirm 失败绝不能导致重发或向管理
+  // 员报失败：nonce 丢失时记日志、不重试（重试也对不上）；其余失败
+  // （DO 抖动）重试一次；两次都失败只记日志。本函数绝不抛错——调用方
+  // 照旧回 ok:true；重试走 idem-mail-rec / idem-ann-rec KV 登记重放
+  // （公告的登记在发送前写，不依赖 confirm，见 send-announcement）。
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      await mailGateCall(env, "/confirm", { key, nonce, value: value ?? null });
+      const r = await mailGateCall(env, "/confirm", { key, nonce, value: value ?? null });
+      if (r && r.ok) return;
+      console.error("mail-gate confirm 失败", key, r);
       return;
     } catch (e) {
+      if (e && (e.code === "nonce_mismatch" || e.code === "key_missing")) {
+        console.error("mail-gate confirm 丢失（" + e.code + "），幂等键未置 done", key);
+        return; // 重试无意义：占位已被他人接管或已过期
+      }
       if (attempt === 1) console.error("mail-gate confirm 失败", key, e);
     }
   }
 }
 
 async function mailGateRelease(env, key, nonce) {
+  // v16 W-M10: nonce 不匹配时 DO 回 409，mailGateCall 抛错——这里接住，
+  // 记一条日志；release 本就是失败路径的清理，绝不向上传播。
   try {
-    await mailGateCall(env, "/release", { key, nonce });
+    const r = await mailGateCall(env, "/release", { key, nonce });
+    if (r && !r.ok) console.error("mail-gate release 失败", key, r);
   } catch (e) {
-    console.error("mail-gate release 失败", key, e);
+    console.error("mail-gate release 失败", key, e && e.code ? e.code : e);
   }
 }
 
@@ -1543,7 +1745,7 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     const lvBucket = path === "/get-couple" ? "lv-get:"
       : (path === "/checkin" || path === "/add-xp" ? "lv-xp:" : "lv:");
     rateLimitPrune();
-    if (!rateLimitOk(lvBucket + clientIp + ":" + lvUser, 30, 60000)) {
+    if (!await rateLimitOkDurable(env, lvBucket + clientIp + ":" + lvUser, 30, 60000)) {
       return json({ ok: false, error: "请求太频繁，请稍后再试" }, 429);
     }
   }
@@ -1789,10 +1991,12 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
   // ----- POST /level/send-announcement：管理员发公告（验身份 + 60 秒去重） -----
   // v10 W-B5/W-P4: 去重查+写进 MailGate DO 原子完成；发送失败释放预留，
   // 不留去重键，60 秒内可重试。
-  // v12 W-M12: 顺序改成 send-mail 的“先记键后发 + 失败补偿”——发送成功后
-  // 写 idem-ann-rec KV 登记（10 分钟 TTL）+ confirm 幂等键；重试时先查登记，
-  // 第一次发送成功但 confirm 丢失时直接重放，不再发第二条（旧版“先发后记键”，
-  // 发送成功 + confirm 两次重试都丢 + 60 秒后重试会重发一条公告）。
+  // v16 W-M12: 登记改成发送的前提（见下面登记处）：先写 idem-ann-rec KV
+  // 登记（10 分钟 TTL），写失败释放占位并 500、什么都不发；写成功后再发
+  // 环信，发送成功后 confirm 幂等键；重试时先查登记，查到直接重放，不再
+  // 发第二条。旧版 v12 是“发送成功后记登记”，残留窗口是“发送成功 + 登记
+  // 写失败 + confirm 丢 + 60 秒后重试 → 重发一条公告”，v16 已关掉；
+  // 新残留见下面登记处的注释（发送失败 + 删登记补偿失败 → 误报已发送）。
   // v11 新功能 (用户 2026-11-11 批准): 除 {username, password, group_id, title,
   // content} 外，再接受 {admin_key, title, content}。admin_key 复用
   // verifyAdminKey 校验（fail closed，失败 403）；通过后跳过密码验证和群主
@@ -1826,7 +2030,7 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
     if (adminKeyMode) {
       // admin_key 猜测也要限流（每 IP 10 次/分钟，与 /stats 同款），先限流后验 key。
       rateLimitPrune();
-      if (!rateLimitOk("ann-admin:" + clientIp, 10, 60000)) {
+      if (!await rateLimitOkDurable(env, "ann-admin:" + clientIp, 10, 60000)) {
         return json({ ok: false, error: "请求太频繁，请稍后再试" }, 429);
       }
       if (!verifyAdminKey(env, body)) return json({ ok: false, error: "管理员密钥不对" }, 403);
@@ -1873,11 +2077,19 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
       }
       const hash = await levelSha256Hex(title + "\n" + content);
       // v11 W-M8: 去重键加上群 id——同一标题+内容发到不同群不再误判重复。
-      // v12 W-M12: 改成 send-mail 的“先记键后发 + 失败补偿”：
-      //   重试时先查 idem-ann-rec 登记——第一次发送成功但 confirm 丢失时
-      //   直接重放，不再发第二条公告；登记只在发送成功后写（10 分钟 TTL），
-      //   发送失败不写登记，重试正常重发。残留窗口与 send-mail 同款：
-      //   需“发送成功 + 登记写失败 + confirm 丢 + 10 分钟后重试”才可能重发。
+      // v16 W-M12: 登记改成发送的前提（旧版 v12 是“发送成功后记登记”，
+      //   残留窗口是“发送成功 + 登记写失败 + confirm 丢 + 60 秒后重试 →
+      //   重发一条公告”）：
+      //   ① 重试时先查 idem-ann-rec 登记——查到直接重放，不再发第二条；
+      //   ② 占位后先写登记（重试 3 次），写失败释放占位并 500，什么都不发；
+      //   ③ 写成功后再发环信；发送失败删登记（补偿，重试 2 次）+ 释放占位，
+      //      让重试正常重发；发送成功后 confirm 幂等键（确认失败只记日志，
+      //      见 mailGateConfirm——重试凭 ② 已写好的登记重放，不依赖 confirm）。
+      //   新残留窗口：发送失败 + 删登记补偿 2 次都失败（或写登记后、
+      //   发送前进程崩了），10 分钟内重试会误报 {ok:true, replayed:true}
+      //   而实际没发——需“环信发送失败 + KV 删失败”双败，结果是公告没发
+      //   但报已发送（管理员看得到公告栏里没有，可改标题重发），不再是
+      //   用户可见的重复公告。
       const annKey = "ann:" + annGroup.id + ":" + hash;
       try {
         const prev = await env.LEVEL_KV.get("idem-ann-rec:" + annKey);
@@ -1888,18 +2100,28 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
       // （旧版 {ok:false, error:"不要重复发送"}，调用方只能按文案区分成败）。
       if (gate.replayed) return json({ ok: true, replayed: true });
       if (!gate.ok) return json({ ok: false, error: gate.error || "正在处理中，请稍后再试" });
-      try {
-        await levelSendEasemobMessage(env, appToken, "chatgroups", annGroup.id, "[公告]" + title + "\n" + content, fromUser, null);
-      } catch (e) {
-        await mailGateRelease(env, annKey, gate.nonce);
-        throw e;
-      }
-      // 发送成功后记 idem 登记（重试 3 次，失败只记日志）+ confirm 幂等键。
+      // 登记是发送的前提：先写登记，写失败直接释放占位并 500，什么都不发。
       try {
         await kvRetry(() => env.LEVEL_KV.put("idem-ann-rec:" + annKey, annGroup.id, { expirationTtl: 600 }), 3);
       } catch (e) {
-        console.error("公告 idem 登记失败", annKey, e);
+        console.error("公告 idem 登记失败，未发送", annKey, e);
+        await mailGateRelease(env, annKey, gate.nonce);
+        return json({ ok: false, error: "公告登记失败，请重试" }, 500);
       }
+      try {
+        await levelSendEasemobMessage(env, appToken, "chatgroups", annGroup.id, "[公告]" + title + "\n" + content, fromUser, null);
+      } catch (e) {
+        // 发送失败删登记（补偿）+ 释放占位，让重试正常重发；
+        // 删登记失败时留一条孤儿登记，见本段头注释的新残留窗口。
+        try {
+          await kvRetry(() => env.LEVEL_KV.delete("idem-ann-rec:" + annKey), 2);
+        } catch (delErr) {
+          console.error("发公告失败后删登记失败（孤儿登记，10 分钟内重试会误报已发送）", annKey, delErr);
+        }
+        await mailGateRelease(env, annKey, gate.nonce);
+        throw e;
+      }
+      // 发送成功：confirm 幂等键（登记已在发送前写好，重试重放不依赖 confirm）。
       await mailGateConfirm(env, annKey, gate.nonce, null);
       return json({ ok: true });
     } catch (e) {
@@ -2270,7 +2492,7 @@ export default {
         if (!body) return withCors(json({ ok: false, error: "请求体不是 JSON 或不是对象" }, 400), request);
         // v10 W-M7: /stats 猜 key 限流（每 IP 10 次/分钟）。
         rateLimitPrune();
-        if (!rateLimitOk("stats:" + ip, 10, 60000)) {
+        if (!await rateLimitOkDurable(env, "stats:" + ip, 10, 60000)) {
           return withCors(json({ ok: false, error: "请求太频繁，请稍后再试" }, 429), request);
         }
         if (!verifyAdminKey(env, body)) {
@@ -2316,7 +2538,7 @@ export default {
         // v11 W-M4: /admin-delete 加限流（每 IP 10 次/分钟，与 /stats 同款），
         // 先限流后验 key，ADMIN_KEY 猜测不再零成本。
         rateLimitPrune();
-        if (!rateLimitOk("adel:" + ip, 10, 60000)) {
+        if (!await rateLimitOkDurable(env, "adel:" + ip, 10, 60000)) {
           return withCors(json({ ok: false, error: "请求太频繁，请稍后再试" }, 429), request);
         }
         // v11 W-M6: username 非字符串直接 400。
@@ -2365,7 +2587,7 @@ export default {
       }
       // v10 W-M7: 删号密码校验限流（每 IP+用户名 20 次/分钟）。
       rateLimitPrune();
-      if (!rateLimitOk("del:" + ip + ":" + username, 20, 60000)) {
+      if (!await rateLimitOkDurable(env, "del:" + ip + ":" + username, 20, 60000)) {
         return withCors(json({ ok: false, error: "请求太频繁，请稍后再试" }, 429), request);
       }
 
