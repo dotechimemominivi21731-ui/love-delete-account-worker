@@ -1,4 +1,4 @@
-// 我们的爱情 - 真注销后端 (Cloudflare Worker) v13
+// 我们的爱情 - 真注销后端 (Cloudflare Worker) v14
 // 作用:
 //   POST /delete-account  app 点"注销账号"时, 先由 Worker 删掉环信服务器上的账号, 再由 app 清本地数据。
 //   POST /stats           管理员工具查用户统计: 已注册多少用户 / 还剩多少名额 (环信免费测试版上限 100)。
@@ -16,6 +16,8 @@
 //     /level/bind             绑定 (v10: 验对方存在、不覆盖已有绑定、换绑先清旧伴侣回指)
 //     /level/unbind           解绑 (等级清零, 特殊称号保留; 未绑定时直接报 ok:false, 不动经验)
 //     /level/check-deleted    批量查环信账号是否已被注销 (供大厅“已注销用户”标记用, v13 新增)
+//     /level/record-recall    1:1 撤回成功后登记一条 (供对方下次进聊天页补删, v14 新增)
+//     /level/get-recalls      1:1 聊天页查对方撤回过我哪些消息 (v14 新增)
 //   level 接口一律 POST JSON { username, password, ... }，密码用环信登录校验；
 //   路径可带 /level 前缀也可不带（代理会去掉前缀再转发，两种都认）。
 // Client Secret 只存在 Worker 的 Secrets 里, 绝不放进 app。
@@ -196,6 +198,32 @@
 //   （fail closed：401/403/5xx 都只算 unknown）。返回
 //   { ok:true, deleted:[...], unknown:[...] }。
 //   删号成功后同名新账号再注册时 GET 返回 200，旧删除记录不影响判定。
+//
+// v14 (2026-11-12) 新功能：POST /level/record-recall + /level/get-recalls
+//   （1:1 撤回兜底——撤回 CMD 是一次性信号，对方 App 被系统杀掉或手机关机
+//   时永远收不到，对方手机上的消息就一直不消失；撤回成功后发送方还在
+//   服务器登记一条，对方下次进 1:1 聊天页问服务器就能补删）:
+//   记录存在 LEVEL_KV：键 recalls:<收件人>:<发送人>，值是 [{id, at}]（按
+//   撤回时间升序，最多 500 条，超了丢最旧的；超过 7 天的条目在读写时
+//   懒清理）。注意是“发送人撤回了发给收件人的消息”，get 时收件人是调
+//   用者本人、发送人是 body.peer；record 时收件人是 body.peer、发送人
+//   是调用者本人——两边别弄反。
+//   失败安全：记录是“至少一次”的兜底，不是精确一次——get 是纯读（只清
+//   7 天以上的过期条目），绝不因“已返回过”就删记录；app 读到后删本地
+//   失败了，下次进页还会再给一次。TTL 7 天是上限（7 天内对方总会开一次
+//   聊天页；7 天还没读到的记录丢了也认——再老的撤回基本没人会翻）。
+//   调用方须先过 levelVerify（username+password，与其余 level 接口
+//   同款），匿名请求直接 403；限流走 handleLevelRequestInner 开头的
+//   通用桶（lv: 每 IP+用户名 30 次/分钟，与其余 level 接口同款）。
+//   record 请求体 { username, password, peer, msgId }，peer 须是合法
+//   用户名且不能是自己，msgId 非空且 ≤128 字符（不合规 400）；成功
+//   { ok:true }，重复登记同一条直接返回 ok（幂等，不重复记）。
+//   get 请求体 { username, password, peer }，peer 须是合法用户名
+//   （不合规 400）；成功 { ok:true, msgIds:[...] }，没有记录时空数组。
+//   两个接口只认 1:1 聊天——大厅撤回走群 CMD 广播，不走这套记录。
+//   （KV 读-改-写有小竞态：同一对用户同时撤回两条时，后写可能覆盖先写
+//   的一条；1:1 撤回是人手一个一个点的，并发窗口极小，接受；record 写
+//   失败时返回 500 让 app 知道——app 本来就是静默 best-effort。)
 //
 // 需要在 Worker 里配置的 Secrets (Dashboard > Settings > Variables):
 //   EASEMOB_ORG           环信控制台里的 org 编号
@@ -599,6 +627,9 @@ const LEVEL_MESSAGE_DAILY_MAX = 4;
 const LEVEL_MAX_MAIL_XP = 10000;
 const LEVEL_MAX_TITLE_LEN = 20;
 const LEVEL_MAX_CLAIMED_MAIL_IDS = 1000;
+// v14: 撤回记录保留 7 天、每对用户最多 500 条（见 record-recall 注释）。
+const RECALL_TTL_MS = 7 * 24 * 3600 * 1000;
+const RECALL_MAX = 500;
 const LEVEL_MAX_STITLES = 50; // v10 W-M13: 特殊称号最多 50 个，防止 DO 记录无限膨胀
 const MIGRATE_BASE_DATE = "2025-10-17"; // v10 W-B1: 经验上限的起算日（两人真正在一起的日子）
 const MIGRATE_LEGACY_XP_ALLOWANCE = 10000; // v10 W-B1: 一次性补登旧版无登记邮件的宽限
@@ -1169,6 +1200,60 @@ async function kvRetry(fn, attempts) {
     }
   }
   throw lastErr;
+}
+
+// v14: 1:1 撤回记录（LEVEL_KV）。
+//   键 recalls:<收件人>:<发送人>，值是 [{id, at}]（按撤回时间升序）。
+//   注意方向：record 时收件人是 peer、发送人是调用者；get 时收件人是
+//   调用者本人、发送人是 peer——两边别弄反。
+//   读：KV 里没有/解析失败 → 空列表（损坏的记录直接丢弃重建，不报错）。
+//   写：去重（同一 msgId 只记一次）→ 丢 7 天以上的过期条目 → 超 500
+//   条时丢最旧的 → kvRetry 写 3 次。读-改-写有小竞态（同一对用户
+//   同时撤回两条时后写可能覆盖先写的一条），1:1 撤回是人手一个一个
+//   点的，接受；写失败时抛错，调用方按 500 处理。
+function recallKey(recipient, sender) {
+  return "recalls:" + recipient + ":" + sender;
+}
+
+function pruneRecallList(list) {
+  const now = Date.now();
+  const kept = [];
+  for (const e of list) {
+    if (!e || typeof e !== "object" || typeof e.id !== "string" || !e.id) continue;
+    if (typeof e.at !== "number" || now - e.at > RECALL_TTL_MS) continue;
+    kept.push({ id: e.id, at: e.at });
+  }
+  while (kept.length > RECALL_MAX) kept.shift();
+  return kept;
+}
+
+async function readRecallList(env, recipient, sender) {
+  let raw = null;
+  try {
+    raw = await env.LEVEL_KV.get(recallKey(recipient, sender));
+  } catch (e) {
+    throw e;
+  }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return pruneRecallList(parsed);
+  } catch (e) {
+    return [];
+  }
+}
+
+async function appendRecall(env, recipient, sender, msgId) {
+  const list = await readRecallList(env, recipient, sender);
+  for (const e of list) {
+    if (e.id === msgId) return false; // 已登记过：幂等，直接返回
+  }
+  list.push({ id: msgId, at: Date.now() });
+  const pruned = pruneRecallList(list);
+  await kvRetry(
+    () => env.LEVEL_KV.put(recallKey(recipient, sender), JSON.stringify(pruned)), 3);
+  return true;
 }
 
 // v7 M-16：每用户等级记录的单写者（Durable Object，强一致）。
@@ -1924,6 +2009,65 @@ async function handleLevelRequestInner(env, path, body, clientIp) {
       }
     }
     return json({ ok: true, deleted: deleted, unknown: unknown });
+  }
+
+  // ----- POST /level/record-recall：1:1 撤回成功后登记一条 -----
+  // v14 新增（撤回兜底）：撤回 CMD 是一次性信号，对方 App 被系统杀掉
+  // 或手机关机时永远收不到；登记后对方下次进 1:1 聊天页调
+  // /level/get-recalls 就能补删。只认 1:1 聊天——大厅撤回走群 CMD
+  // 广播，不走这套记录。调用方须先过 levelVerify，匿名 403。
+  if (path === "/record-recall") {
+    const username = await levelVerify(env, body);
+    if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
+    const peer = strField(body, "peer") || "";
+    if (!peer || !isValidEasemobUsername(peer)) {
+      return json({ ok: false, error: "对方用户名不对" }, 400);
+    }
+    if (peer === username) {
+      return json({ ok: false, error: "不能给自己登记撤回" }, 400);
+    }
+    const msgId = strField(body, "msgId") || "";
+    if (!msgId || msgId.length > 128) {
+      return json({ ok: false, error: "消息 id 不对" }, 400);
+    }
+    try {
+      await appendRecall(env, peer, username, msgId);
+    } catch (e) {
+      console.error("登记撤回失败", peer, username, e);
+      return json({ ok: false, error: "服务器出错，请稍后再试" }, 500);
+    }
+    return json({ ok: true });
+  }
+
+  // ----- POST /level/get-recalls：1:1 聊天页查对方撤回过我哪些消息 -----
+  // v14 新增：纯读。返回对方在和我的 1:1 聊天里撤回过的消息 id（7 天内）。
+  // 绝不因“已返回过”就删记录——app 读到后删本地失败了，下次进页还会
+  // 再给一次；只有超过 7 天的过期条目在返回前清理（顺手写回）。
+  if (path === "/get-recalls") {
+    const username = await levelVerify(env, body);
+    if (!username) return json({ ok: false, error: "身份校验失败" }, 403);
+    const peer = strField(body, "peer") || "";
+    if (!peer || !isValidEasemobUsername(peer)) {
+      return json({ ok: false, error: "对方用户名不对" }, 400);
+    }
+    let list;
+    try {
+      const key = recallKey(username, peer);
+      const raw = await env.LEVEL_KV.get(key);
+      let parsed = null;
+      if (raw) {
+        try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+      }
+      list = Array.isArray(parsed) ? pruneRecallList(parsed) : [];
+      // 读时清理了过期/损坏条目才写回（没清掉就不写，少一次 KV 写）。
+      if (Array.isArray(parsed) && parsed.length !== list.length) {
+        await kvRetry(() => env.LEVEL_KV.put(key, JSON.stringify(list)), 3);
+      }
+    } catch (e) {
+      console.error("查撤回记录失败", username, peer, e);
+      return json({ ok: false, error: "服务器出错，请稍后再试" }, 500);
+    }
+    return json({ ok: true, msgIds: list.map((e) => e.id) });
   }
 
   // ----- POST /level/migrate：首次把手机 EXT 里的等级快照迁到服务器 -----
